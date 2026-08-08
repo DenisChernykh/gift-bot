@@ -1,0 +1,1 @@
+ALTER TABLE `wizard_sessions` ADD `draft_data` text DEFAULT '{}' NOT NULL;

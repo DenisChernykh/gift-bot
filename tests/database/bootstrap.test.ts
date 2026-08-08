@@ -84,12 +84,15 @@ describe('database boundary', () => {
 
       expect(giveaway).toEqual({ id: 'giveaway-1', title: 'August giveaway' });
 
+      const migrationCount = await opened.database.all<{ count: number }>(
+        'select count(*) as count from __drizzle_migrations',
+      );
       await migrateDatabase(opened.database);
       expect(
         await opened.database.all<{ count: number }>(
           'select count(*) as count from __drizzle_migrations',
         ),
-      ).toEqual([{ count: 1 }]);
+      ).toEqual(migrationCount);
     } finally {
       await close?.();
       rmSync(directory, { force: true, recursive: true });

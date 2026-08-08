@@ -8,6 +8,20 @@
       "when": 1786188303916,
       "tag": "0000_useful_silver_centurion",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786193358293,
+      "tag": "0001_volatile_sharon_carter",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786193750380,
+      "tag": "0002_dusty_red_skull",
+      "breakpoints": true
     }
   ]
 }

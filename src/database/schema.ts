@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 export const giveaways = sqliteTable('giveaways', {
@@ -22,14 +23,14 @@ export const wizardSessions = sqliteTable(
     giveawayId: text('giveaway_id').references(() => giveaways.id),
     step: text('step').notNull(),
     status: text('status').notNull(),
+    draftData: text('draft_data').notNull().default('{}'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
   (table) => [
-    uniqueIndex('wizard_sessions_administrator_status_unique').on(
-      table.administratorTelegramId,
-      table.status,
-    ),
+    uniqueIndex('wizard_sessions_administrator_active_unique')
+      .on(table.administratorTelegramId)
+      .where(sql`${table.status} = 'active'`),
   ],
 );
 
@@ -84,10 +85,22 @@ export const pendingChannelConnections = sqliteTable(
     inviteId: text('invite_id').references(() => channelInvites.id),
     telegramUserId: integer('telegram_user_id').notNull(),
     status: text('status').notNull(),
+    candidateTelegramChatId: integer('candidate_telegram_chat_id'),
+    candidateUsername: text('candidate_username'),
+    candidateTitle: text('candidate_title'),
+    rightsVerifiedAt: integer('rights_verified_at'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
-  (table) => [index('pending_channel_connections_user_status_index').on(table.telegramUserId, table.status)],
+  (table) => [
+    index('pending_channel_connections_user_status_index').on(
+      table.telegramUserId,
+      table.status,
+    ),
+    uniqueIndex('pending_channel_connections_user_active_unique')
+      .on(table.telegramUserId)
+      .where(sql`${table.status} = 'active'`),
+  ],
 );
 
 export const callbackActions = sqliteTable(
