@@ -3,6 +3,7 @@ import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
 import { createStoredToken } from '../domain/tokens.js';
 import type {
   GiveawayLifecycleRepository,
+  PublicationFailureDiagnostic,
   PublicationDelivery,
   PublicationGiveaway,
 } from './ports/giveaway-lifecycle-repository.js';
@@ -20,6 +21,7 @@ type PublicationDependencies = {
   now: () => number;
   sleep: (milliseconds: number) => Promise<void>;
   maximumRateLimitRetries: number;
+  logger: { error(event: string, fields?: Record<string, unknown>): void };
 };
 
 const defaultDependencies: Omit<PublicationDependencies, 'botUsername'> = {
@@ -29,6 +31,7 @@ const defaultDependencies: Omit<PublicationDependencies, 'botUsername'> = {
   sleep: (milliseconds) =>
     new Promise((resolve) => setTimeout(resolve, milliseconds)),
   maximumRateLimitRetries: 3,
+  logger: { error: () => undefined },
 };
 
 export type PublicationResult =
@@ -36,7 +39,7 @@ export type PublicationResult =
   | { kind: 'already_active'; giveawayId: string }
   | { kind: 'publishing'; giveawayId: string }
   | { kind: 'rolled_back'; giveawayId: string }
-  | { kind: 'failed'; giveawayId: string };
+  | { kind: 'failed'; giveawayId: string; diagnostic: PublicationFailureDiagnostic };
 
 export class GiveawayPublicationService {
   readonly #repository: GiveawayLifecycleRepository;
@@ -73,7 +76,13 @@ export class GiveawayPublicationService {
         channel.telegramChatId,
       );
       if (!hasPublicationAdministratorRights(membership)) {
-        throw new Error(`Channel @${channel.username} is missing publication rights`);
+        const diagnostic: PublicationFailureDiagnostic = {
+          stage: 'preflight',
+          errorKind: 'missing_publication_rights',
+          channel,
+        };
+        this.#logFailure(giveawayId, diagnostic);
+        throw new PublicationFailureError(diagnostic);
       }
     }
 
@@ -131,15 +140,18 @@ export class GiveawayPublicationService {
         });
       } catch (error) {
         if (!(error instanceof TelegramDeliveryError) || error.outcome === 'unknown') {
+          const diagnostic: PublicationFailureDiagnostic = {
+            stage: 'send_unknown',
+            errorKind: error instanceof TelegramDeliveryError ? 'telegram_unknown' : 'unexpected_error',
+            channel,
+          };
           await this.#repository.markPublicationDeliveryUnknown(
             delivery.id,
             this.#dependencies.now(),
           );
-          await this.#repository.failPublication(
-            publicationRunId,
-            this.#dependencies.now(),
-          );
-          return { kind: 'failed', giveawayId };
+          await this.#repository.failPublication({ publicationRunId, failure: diagnostic, now: this.#dependencies.now() });
+          this.#logFailure(giveawayId, diagnostic);
+          return { kind: 'failed', giveawayId, diagnostic };
         }
 
         return this.#rollback(
@@ -189,6 +201,7 @@ export class GiveawayPublicationService {
   ): Promise<PublicationResult> {
     const deletedDeliveryIds: string[] = [];
     let complete = true;
+    let failure: PublicationFailureDiagnostic | undefined;
     for (const delivery of [...knownDeliveries].reverse()) {
       try {
         await this.#gateway.deleteMessage(
@@ -198,15 +211,35 @@ export class GiveawayPublicationService {
         deletedDeliveryIds.push(delivery.id);
       } catch {
         complete = false;
+        const channel = await this.#channelForDelivery(giveawayId, delivery.giveawayChannelId);
+        failure = { stage: 'rollback_delete', errorKind: 'delete_failed', ...(channel ? { channel } : {}) };
       }
     }
     await this.#repository.finishPublicationRollback({
       publicationRunId,
       deletedDeliveryIds,
       complete,
+      ...(failure ? { failure } : {}),
       now: this.#dependencies.now(),
     });
-    return { kind: complete ? 'rolled_back' : 'failed', giveawayId };
+    if (complete) return { kind: 'rolled_back', giveawayId };
+    const diagnostic = failure!;
+    this.#logFailure(giveawayId, diagnostic);
+    return { kind: 'failed', giveawayId, diagnostic };
+  }
+
+  async #channelForDelivery(giveawayId: string, channelId: string) {
+    const giveaway = await this.#repository.getPublicationGiveaway(giveawayId);
+    return giveaway.channels.find((channel) => channel.id === channelId);
+  }
+
+  #logFailure(giveawayId: string, diagnostic: PublicationFailureDiagnostic) {
+    this.#dependencies.logger.error('publication_failed', {
+      giveawayId,
+      stage: diagnostic.stage,
+      errorKind: diagnostic.errorKind,
+      ...(diagnostic.channel ? { channelId: diagnostic.channel.id, channelUsername: diagnostic.channel.username } : {}),
+    });
   }
 
   #renderMessage(
@@ -228,5 +261,15 @@ export class GiveawayPublicationService {
         giveaway.content.kind === 'photo' ? (giveaway.content.fileId ?? null) : null,
       joinUrl: `https://t.me/${this.#dependencies.botUsername}?start=join_${joinToken}`,
     };
+  }
+}
+
+export class PublicationFailureError extends Error {
+  constructor(readonly diagnostic: PublicationFailureDiagnostic) {
+    super(
+      diagnostic.channel
+        ? `Channel @${diagnostic.channel.username} is missing publication rights`
+        : `Publication failed at ${diagnostic.stage}`,
+    );
   }
 }

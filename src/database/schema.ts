@@ -141,8 +141,10 @@ export const publicationRuns = sqliteTable(
     giveawayId: text('giveaway_id')
       .notNull()
       .references(() => giveaways.id),
-    status: text('status').notNull(),
-    startedAt: integer('started_at').notNull(),
+  status: text('status').notNull(),
+  failureStage: text('failure_stage'),
+  failureErrorKind: text('failure_error_kind'),
+  startedAt: integer('started_at').notNull(),
     finishedAt: integer('finished_at'),
   },
   (table) => [index('publication_runs_giveaway_index').on(table.giveawayId)],

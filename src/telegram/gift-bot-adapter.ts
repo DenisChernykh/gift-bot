@@ -5,7 +5,7 @@ import type { ChannelAuthorizationService } from '../application/channel-authori
 import type { DraftWizardService } from '../application/draft-wizard-service.js';
 import type { GiveawayCancellationService } from '../application/giveaway-cancellation-service.js';
 import type { GiveawayManagementService } from '../application/giveaway-management-service.js';
-import type { GiveawayPublicationService } from '../application/giveaway-publication-service.js';
+import { PublicationFailureError, type GiveawayPublicationService } from '../application/giveaway-publication-service.js';
 import type { ActiveWizard } from '../application/ports/giveaway-creation-repository.js';
 import type { GiveawayMessageEntity } from '../domain/giveaway-validation.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
@@ -61,7 +61,7 @@ export function registerGiftBotHandlers(
     await context.reply(
       giveaways.length === 0
         ? 'Сохранённых розыгрышей пока нет.'
-        : giveaways.map((item) => `${item.title} — ${item.state}`).join('\n'),
+        : giveaways.map(formatGiveawayListItem).join('\n\n'),
     );
   });
 
@@ -355,10 +355,21 @@ async function handleCallbackAction(
       return;
     }
     case 'publish_giveaway': {
-      const result = await dependencies.publication.publish(
-        stringPayload(action.payload, 'giveawayId'),
-      );
-      await context.reply(publicationResultText(result.kind));
+      try {
+        const result = await dependencies.publication.publish(
+          stringPayload(action.payload, 'giveawayId'),
+        );
+        await context.reply(publicationResultText(result));
+      } catch (error) {
+        if (error instanceof PublicationFailureError) {
+          await context.reply(formatPublicationDiagnostic({
+            giveawayId: stringPayload(action.payload, 'giveawayId'),
+            diagnostic: error.diagnostic,
+          }));
+          return;
+        }
+        throw error;
+      }
       return;
     }
     case 'cancel_giveaway': {
@@ -430,7 +441,7 @@ async function replyWizardPrompt(
 ) {
   switch (wizard.step) {
     case 'title':
-      await context.reply('Введите внутреннее название розыгрыша (до 100 символов).');
+      await context.reply('Введите внутреннее название розыгрыша (от 1 до 100 символов).');
       return;
     case 'winner_count':
       await context.reply('Введите число победителей от 1 до 50.');
@@ -491,12 +502,16 @@ async function replyWizardPrompt(
       const channelList = giveaway.channels
         .map((channel) => `@${channel.username} — подтверждён`)
         .join('\n');
-      await context.reply(
-        `${rendered}\n\nКаналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`,
-        {
-          reply_markup: new InlineKeyboard().text('Опубликовать', publish),
-        },
-      );
+      const replyMarkup = new InlineKeyboard().text('Опубликовать', publish);
+      if (giveaway.content.kind === 'photo' && giveaway.content.fileId) {
+        await context.replyWithPhoto(giveaway.content.fileId, {
+          caption: rendered,
+          reply_markup: replyMarkup,
+        });
+        await context.reply(`Каналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`);
+        return;
+      }
+      await context.reply(`${rendered}\n\nКаналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`, { reply_markup: replyMarkup });
     }
   }
 }
@@ -551,17 +566,36 @@ function numberPayload(payload: Record<string, unknown>, key: string): number {
   return value;
 }
 
-function publicationResultText(kind: string) {
-  switch (kind) {
+function publicationResultText(result: Awaited<ReturnType<GiveawayPublicationService['publish']>>) {
+  switch (result.kind) {
     case 'active':
       return 'Розыгрыш опубликован во всех каналах.';
     case 'already_active':
       return 'Розыгрыш уже опубликован.';
     case 'publishing':
       return 'Публикация уже выполняется.';
+    case 'failed':
+      return formatPublicationDiagnostic({ giveawayId: result.giveawayId, diagnostic: result.diagnostic });
     case 'rolled_back':
       return 'Публикация не удалась; созданные посты удалены, черновик сохранён.';
     default:
       return 'Публикация остановлена в состоянии failed; повторная отправка не выполнялась.';
   }
+}
+
+function formatGiveawayListItem(item: Awaited<ReturnType<GiveawayManagementService['listGiveaways']>>[number]) {
+  return `${item.title} — ${item.state}${item.failure ? `\n${formatPublicationDiagnostic({ giveawayId: item.id, diagnostic: item.failure })}` : ''}`;
+}
+
+function formatPublicationDiagnostic(input: {
+  giveawayId: string;
+  diagnostic: { stage: string; errorKind: string; channel?: { id: string; username: string; telegramChatId: number }; channels?: Array<{ id: string; username: string; telegramChatId: number; messageId?: number | null }> };
+}) {
+  const diagnosticChannels: Array<{ id: string; username: string; telegramChatId: number; messageId?: number | null }> =
+    input.diagnostic.channels ?? (input.diagnostic.channel ? [input.diagnostic.channel] : []);
+  const channels = diagnosticChannels.map((channel) => {
+    const link = channel.messageId ? ` https://t.me/${channel.username}/${channel.messageId}` : '';
+    return `@${channel.username} (ID ${channel.id}, chat ${channel.telegramChatId})${link}`;
+  }).join('\n');
+  return `Публикация ${input.giveawayId} остановлена. Этап: ${input.diagnostic.stage}; ошибка: ${input.diagnostic.errorKind}.${channels ? `\nКаналы:\n${channels}` : ''}`;
 }

@@ -1,10 +1,22 @@
 import type { PublicationGiveaway } from './giveaway-lifecycle-repository.js';
 
+export type FailedPublicationChannel = {
+  id: string;
+  username: string;
+  telegramChatId: number;
+  messageId: number | null;
+};
+
 export type GiveawayListItem = {
   id: string;
   title: string;
   state: string;
   updatedAt: number;
+  failure?: {
+    stage: string;
+    errorKind: string;
+    channels: FailedPublicationChannel[];
+  };
 };
 
 export type JoinLinkTarget = {

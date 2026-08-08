@@ -27,6 +27,14 @@ export type PublicationDelivery = {
   messageKind: 'text' | 'photo' | null;
 };
 
+export type PublicationFailureStage = 'send_unknown' | 'rollback_delete' | 'recovery_unknown_send' | 'recovery_rollback_delete';
+
+export type PublicationFailureDiagnostic = {
+  stage: PublicationFailureStage | 'preflight';
+  errorKind: string;
+  channel?: PublicationChannel;
+};
+
 export type RecoverablePublication = {
   runId: string;
   giveawayId: string;
@@ -75,9 +83,14 @@ export interface GiveawayLifecycleRepository {
     publicationRunId: string;
     deletedDeliveryIds: string[];
     complete: boolean;
+    failure?: PublicationFailureDiagnostic;
     now: number;
   }): Promise<void>;
-  failPublication(publicationRunId: string, now: number): Promise<void>;
+  failPublication(input: {
+    publicationRunId: string;
+    failure: PublicationFailureDiagnostic;
+    now: number;
+  }): Promise<void>;
   listRecoverablePublications(): Promise<RecoverablePublication[]>;
   getCancellationTargetCount(giveawayId: string): Promise<number>;
   prepareCancellation(input: {

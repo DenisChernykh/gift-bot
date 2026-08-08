@@ -39,6 +39,7 @@ const channels = new ChannelAuthorizationService(repository);
 const callbacks = new CallbackActionService(repository);
 const publication = new GiveawayPublicationService(repository, gateway, {
   botUsername: bot.botInfo.username,
+  logger,
 });
 const cancellation = new GiveawayCancellationService(repository, gateway);
 const management = new GiveawayManagementService(repository);

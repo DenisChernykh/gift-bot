@@ -17,6 +17,7 @@ import type {
   TelegramGateway,
   TelegramGiveawayMessage,
 } from '../../src/application/ports/telegram-gateway.js';
+import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
 import { openDatabase } from '../../src/database/client.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
@@ -74,6 +75,7 @@ class FakeTelegramApi {
 
 class FakePublicationGateway implements TelegramGateway {
   readonly operations: string[] = [];
+  sendFailure?: Error;
   #messageId = 500;
 
   async getChannelMembership() {
@@ -87,6 +89,7 @@ class FakePublicationGateway implements TelegramGateway {
 
   async sendGiveawayMessage(input: TelegramGiveawayMessage) {
     this.operations.push(`send:${input.chatId}`);
+    if (this.sendFailure) throw this.sendFailure;
     return { messageId: ++this.#messageId };
   }
 
@@ -388,7 +391,9 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
       'внутреннее название',
     );
-    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain('100');
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
+      'Введите внутреннее название розыгрыша (от 1 до 100 символов).',
+    );
     await bot.handleUpdate(privateMessageUpdate(updateId++, 700, 'Августовский подарок'));
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
       'число победителей',
@@ -433,9 +438,13 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     const channelsAgain = fakeApi.sentMessages().at(-1)!;
     const previewData = callbackData(channelsAgain, 'К предпросмотру');
     await bot.handleUpdate(callbackUpdate(updateId++, 700, previewData));
-    const preview = fakeApi.sentMessages().at(-1)!;
-    expect(preview.payload.text).toContain('Екатеринбург, UTC+5');
-    expect(preview.payload.text).toContain('условия нельзя изменить');
+    const preview = fakeApi.calls.filter((call) => call.method === 'sendPhoto').at(-1)!;
+    expect(preview.payload).toMatchObject({
+      chat_id: 700,
+      photo: 'largest-photo-file-id',
+      caption: expect.stringContaining('Екатеринбург, UTC+5'),
+    });
+    expect(preview.payload.caption).not.toContain('Каналы:');
     const publishData = callbackData(preview, 'Опубликовать');
     await bot.handleUpdate(callbackUpdate(updateId++, 700, publishData));
     await bot.handleUpdate(callbackUpdate(updateId++, 700, publishData));
@@ -446,6 +455,54 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(await database.all('select state from giveaways')).toEqual([
       { state: 'active' },
     ]);
+  });
+
+  it('shows the administrator a failed publication diagnostic and keeps it in /giveaways', async () => {
+    const { bot, database, fakeApi, telegramGateway, callbacks } = await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('diagnostic-giveaway', 'Diagnostic gift', 'draft', 1, ?, 0,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW + 86_400_000, NOW, NOW],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('diagnostic-channel', 'diagnostic-giveaway', -6101,
+                 'diagnostic_channel', 'Diagnostic channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    telegramGateway.sendFailure = new TelegramDeliveryError(
+      'connection reset after request',
+      'unknown',
+    );
+    const action = await callbacks.issue({
+      actorTelegramId: 700,
+      giveawayId: 'diagnostic-giveaway',
+      action: 'publish_giveaway',
+      payload: { giveawayId: 'diagnostic-giveaway' },
+    });
+
+    await bot.handleUpdate(callbackUpdate(70, 700, `admin:${action.token}`));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'diagnostic-giveaway',
+    );
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain('send_unknown');
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      '@diagnostic_channel',
+    );
+
+    await bot.handleUpdate(privateMessageUpdate(71, 700, '/giveaways'));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'Diagnostic gift — failed',
+    );
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain('send_unknown');
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      '@diagnostic_channel',
+    );
   });
 
   it('lists giveaways and confirms /cancel before synchronizing an active post', async () => {

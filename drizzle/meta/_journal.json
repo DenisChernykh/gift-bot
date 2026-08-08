@@ -29,6 +29,13 @@
       "when": 1786195691544,
       "tag": "0003_right_blockbuster",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1786197000000,
+      "tag": "0004_publication_failure_diagnostics",
+      "breakpoints": true
     }
   ]
 }

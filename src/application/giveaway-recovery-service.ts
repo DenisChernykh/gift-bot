@@ -38,10 +38,11 @@ export class GiveawayRecoveryService {
         ['sending', 'unknown'].includes(delivery.status),
       )
     ) {
-      await this.#repository.failPublication(
-        publication.runId,
-        this.#dependencies.now(),
-      );
+      await this.#repository.failPublication({
+        publicationRunId: publication.runId,
+        failure: { stage: 'recovery_unknown_send', errorKind: 'unknown_delivery' },
+        now: this.#dependencies.now(),
+      });
       return { giveawayId: publication.giveawayId, kind: 'failed' as const };
     }
     if (
@@ -77,6 +78,7 @@ export class GiveawayRecoveryService {
       publicationRunId: publication.runId,
       deletedDeliveryIds,
       complete,
+      ...(!complete ? { failure: { stage: 'recovery_rollback_delete' as const, errorKind: 'delete_failed' } } : {}),
       now: this.#dependencies.now(),
     });
     return {

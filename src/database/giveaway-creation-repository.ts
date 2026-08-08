@@ -742,12 +742,52 @@ export class SqliteGiveawayCreationRepository
   async listGiveaways(
     administratorTelegramId: number,
   ): Promise<GiveawayListItem[]> {
-    return this.#database.all<GiveawayListItem>(
+    const giveaways = await this.#database.all<GiveawayListItem>(
       `select id, title, state, updated_at as updatedAt
          from giveaways where created_by_telegram_id = ?
          order by updated_at desc, id`,
       [administratorTelegramId],
     );
+    const failures = await this.#database.all<{
+      giveawayId: string;
+      stage: string;
+      errorKind: string;
+      channelId: string | null;
+      username: string | null;
+      telegramChatId: number | null;
+      messageId: number | null;
+      deliveryStatus: string | null;
+    }>(
+      `select r.giveaway_id as giveawayId, r.failure_stage as stage,
+              r.failure_error_kind as errorKind, c.id as channelId,
+              c.username as username, c.telegram_chat_id as telegramChatId,
+              d.message_id as messageId, d.status as deliveryStatus
+         from publication_runs r
+         left join publication_deliveries d on d.publication_run_id = r.id
+         left join giveaway_channels c on c.id = d.giveaway_channel_id
+        where r.status = 'failed' and r.failure_stage is not null
+        order by r.finished_at desc, r.id, d.created_at, d.id`,
+    );
+    return giveaways.map((giveaway) => {
+      const rows = failures.filter((failure) => failure.giveawayId === giveaway.id);
+      const first = rows[0];
+      if (!first) return giveaway;
+      const affected = rows.filter((row) =>
+        first.stage.includes('unknown')
+          ? ['sending', 'unknown'].includes(row.deliveryStatus ?? '')
+          : first.stage.includes('rollback_delete')
+            ? row.deliveryStatus === 'delivered'
+            : true,
+      );
+      return {
+        ...giveaway,
+        failure: {
+          stage: first.stage,
+          errorKind: first.errorKind,
+          channels: affected.flatMap((row) => row.channelId && row.username && row.telegramChatId !== null ? [{ id: row.channelId, username: row.username, telegramChatId: row.telegramChatId, messageId: row.messageId }] : []),
+        },
+      };
+    });
   }
 
   async findJoinLinkTarget(tokenHash: string): Promise<JoinLinkTarget | null> {
@@ -963,6 +1003,7 @@ export class SqliteGiveawayCreationRepository
     publicationRunId: string;
     deletedDeliveryIds: string[];
     complete: boolean;
+    failure?: { stage: string; errorKind: string };
     now: number;
   }): Promise<void> {
     await this.#database.transaction(async (transaction) => {
@@ -980,8 +1021,8 @@ export class SqliteGiveawayCreationRepository
         );
       }
       await transaction.execute(
-        'update publication_runs set status = ?, finished_at = ? where id = ?',
-        [input.complete ? 'rolled_back' : 'failed', input.now, input.publicationRunId],
+        'update publication_runs set status = ?, failure_stage = ?, failure_error_kind = ?, finished_at = ? where id = ?',
+        [input.complete ? 'rolled_back' : 'failed', input.failure?.stage ?? null, input.failure?.errorKind ?? null, input.now, input.publicationRunId],
       );
       await transaction.execute(
         'update giveaways set state = ?, updated_at = ? where id = ?',
@@ -994,21 +1035,21 @@ export class SqliteGiveawayCreationRepository
     });
   }
 
-  async failPublication(publicationRunId: string, now: number): Promise<void> {
+  async failPublication(input: { publicationRunId: string; failure: { stage: string; errorKind: string }; now: number }): Promise<void> {
     await this.#database.transaction(async (transaction) => {
       const rows = await transaction.all<{ giveawayId: string }>(
         'select giveaway_id as giveawayId from publication_runs where id = ?',
-        [publicationRunId],
+        [input.publicationRunId],
       );
       const giveawayId = rows[0]?.giveawayId;
       if (!giveawayId) throw new Error('Unknown publication run');
       await transaction.execute(
-        "update publication_runs set status = 'failed', finished_at = ? where id = ?",
-        [now, publicationRunId],
+        "update publication_runs set status = 'failed', failure_stage = ?, failure_error_kind = ?, finished_at = ? where id = ?",
+        [input.failure.stage, input.failure.errorKind, input.now, input.publicationRunId],
       );
       await transaction.execute(
         "update giveaways set state = 'failed', updated_at = ? where id = ?",
-        [now, giveawayId],
+        [input.now, giveawayId],
       );
       await transaction.execute(
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'pending'",
