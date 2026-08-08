@@ -18,20 +18,26 @@ describe('SQLite bootstrap', () => {
   it('enables safety pragmas and creates every Task 1 table through migrations', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'gift-bot-test-'));
     const databasePath = join(directory, 'gift-bot.sqlite');
-    let sqlite: ReturnType<typeof openDatabase>['sqlite'] | undefined;
+    let close: (() => Promise<void>) | undefined;
 
     try {
-      ({ sqlite } = openDatabase(databasePath));
-      await migrateDatabase(sqlite);
+      const opened = openDatabase(databasePath);
+      close = opened.close;
+      await migrateDatabase(opened.database);
 
-      const tables = sqlite
-        .prepare("select name from sqlite_master where type = 'table'")
-        .all()
-        .map((row) => (row as { name: string }).name);
+      const tables = (await opened.database.all<{ name: string }>(
+        "select name from sqlite_master where type = 'table'",
+      )).map((row) => row.name);
 
-      expect(sqlite.prepare('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 });
-      expect(sqlite.prepare('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
-      expect(sqlite.prepare('PRAGMA busy_timeout').get()).toEqual({ timeout: 5000 });
+      expect(await opened.database.all('PRAGMA foreign_keys')).toEqual([
+        { foreign_keys: 1 },
+      ]);
+      expect(await opened.database.all('PRAGMA journal_mode')).toEqual([
+        { journal_mode: 'wal' },
+      ]);
+      expect(await opened.database.all('PRAGMA busy_timeout')).toEqual([
+        { timeout: 5000 },
+      ]);
       expect(tables).toEqual(
         expect.arrayContaining([
           'giveaways',
@@ -47,7 +53,7 @@ describe('SQLite bootstrap', () => {
         ]),
       );
     } finally {
-      sqlite?.close();
+      await close?.();
       rmSync(directory, { force: true, recursive: true });
     }
   });
@@ -57,20 +63,19 @@ describe('database boundary', () => {
   it('maps real Drizzle selects from DatabaseSync rows and skips an already-applied migration', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'gift-bot-test-'));
     const databasePath = join(directory, 'gift-bot.sqlite');
-    let sqlite: ReturnType<typeof openDatabase>['sqlite'] | undefined;
+    let close: (() => Promise<void>) | undefined;
 
     try {
       const opened = openDatabase(databasePath);
-      sqlite = opened.sqlite;
-      await migrateDatabase(sqlite);
-      sqlite
-        .prepare(
-          `insert into giveaways (
+      close = opened.close;
+      await migrateDatabase(opened.database);
+      await opened.database.execute(
+        `insert into giveaways (
             id, title, state, winner_count, deadline_utc, referrals_enabled,
             content_kind, content_text, created_by_telegram_id, created_at, updated_at
           ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run('giveaway-1', 'August giveaway', 'draft', 1, 0, 0, 'text', 'Hello', 42, 0, 0);
+        ['giveaway-1', 'August giveaway', 'draft', 1, 0, 0, 'text', 'Hello', 42, 0, 0],
+      );
 
       const giveaway = await createDatabaseProxy(opened.database)
         .select({ id: giveaways.id, title: giveaways.title })
@@ -79,28 +84,66 @@ describe('database boundary', () => {
 
       expect(giveaway).toEqual({ id: 'giveaway-1', title: 'August giveaway' });
 
-      await migrateDatabase(sqlite);
+      await migrateDatabase(opened.database);
       expect(
-        sqlite.prepare('select count(*) as count from __drizzle_migrations').get(),
-      ).toEqual({ count: 1 });
+        await opened.database.all<{ count: number }>(
+          'select count(*) as count from __drizzle_migrations',
+        ),
+      ).toEqual([{ count: 1 }]);
     } finally {
-      sqlite?.close();
+      await close?.();
       rmSync(directory, { force: true, recursive: true });
     }
   });
 
-  it('exposes only the serialized operation boundary to application code', () => {
+  it('exposes only the serialized operation boundary to application code', async () => {
     const opened = openDatabase(':memory:');
 
     try {
-      expect(opened).not.toHaveProperty('drizzle');
+      expect(Object.keys(opened)).toEqual(['database', 'close']);
     } finally {
-      opened.sqlite.close();
+      await opened.close();
+    }
+  });
+
+  it('waits to close until an active transaction releases database ownership', async () => {
+    const opened = openDatabase(':memory:');
+    const transactionReachedWait = Promise.withResolvers<void>();
+    const releaseWait = Promise.withResolvers<void>();
+    let closed = false;
+
+    try {
+      await opened.database.execute('create table entries (value text not null)');
+      const transaction = opened.database.transaction(async () => {
+        transactionReachedWait.resolve();
+        await releaseWait.promise;
+      });
+
+      await transactionReachedWait.promise;
+      const closeDatabase = (opened as unknown as { close?: () => Promise<void> }).close;
+      if (!closeDatabase) {
+        throw new Error('openDatabase must expose an ownership-aware close method');
+      }
+
+      const close = closeDatabase().then(() => {
+        closed = true;
+      });
+      await Promise.resolve();
+      expect(closed).toBe(false);
+
+      releaseWait.resolve();
+      await transaction;
+      await close;
+      expect(closed).toBe(true);
+    } finally {
+      if ('close' in opened && typeof opened.close === 'function') {
+        await opened.close();
+      }
     }
   });
 
   it('keeps an unrelated write out of a transaction that later rolls back', async () => {
-    const { sqlite, database } = openDatabase(':memory:');
+    const { database, close } = openDatabase(':memory:');
     let releaseTransaction: () => void;
     const transactionReachedWait = Promise.withResolvers<void>();
     const releaseWait = Promise.withResolvers<void>();
@@ -127,7 +170,7 @@ describe('database boundary', () => {
         { value: 'outside' },
       ]);
     } finally {
-      sqlite.close();
+      await close();
     }
   });
 });

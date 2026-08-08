@@ -1,22 +1,19 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
 
 import 'dotenv/config';
 import { migrate } from 'drizzle-orm/sqlite-proxy/migrator';
 
 import {
-  createDatabaseBoundary,
   createDatabaseProxy,
   openDatabase,
+  type DatabaseBoundary,
 } from './client.js';
 
 const migrationsFolder = fileURLToPath(new URL('../../drizzle', import.meta.url));
 
-export async function migrateDatabase(sqlite: DatabaseSync): Promise<void> {
-  const database = createDatabaseBoundary(sqlite);
-
+export async function migrateDatabase(database: DatabaseBoundary): Promise<void> {
   await migrate(
     createDatabaseProxy(database),
     async (queries) =>
@@ -31,11 +28,11 @@ export async function migrateDatabase(sqlite: DatabaseSync): Promise<void> {
 
 export async function migrateDatabaseAt(databasePath: string): Promise<void> {
   mkdirSync(dirname(databasePath), { recursive: true });
-  const { sqlite } = openDatabase(databasePath);
+  const { database, close } = openDatabase(databasePath);
   try {
-    await migrateDatabase(sqlite);
+    await migrateDatabase(database);
   } finally {
-    sqlite.close();
+    await close();
   }
 }
 

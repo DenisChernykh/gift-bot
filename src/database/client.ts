@@ -7,9 +7,10 @@ import * as schema from './schema.js';
 
 type DatabaseRow = Record<string, unknown>;
 
-class DatabaseBoundary {
+export class DatabaseBoundary {
   private readonly transactionContext = new AsyncLocalStorage<DatabaseBoundary>();
   private locked = false;
+  private closed = false;
   private readonly waiters: Array<() => void> = [];
 
   constructor(private readonly sqlite: DatabaseSync) {}
@@ -46,6 +47,7 @@ class DatabaseBoundary {
     const release = await this.acquire();
 
     try {
+      this.assertOpen();
       this.sqlite.exec('BEGIN');
       return await this.transactionContext.run(this, async () => {
         try {
@@ -62,13 +64,31 @@ class DatabaseBoundary {
     }
   }
 
+  async close(): Promise<void> {
+    if (this.transactionContext.getStore() === this) {
+      throw new Error('Cannot close the database from an active transaction');
+    }
+
+    const release = await this.acquire();
+    try {
+      if (!this.closed) {
+        this.sqlite.close();
+        this.closed = true;
+      }
+    } finally {
+      release();
+    }
+  }
+
   private async exclusively<Result>(operation: () => Result): Promise<Result> {
     if (this.transactionContext.getStore() === this) {
+      this.assertOpen();
       return operation();
     }
 
     const release = await this.acquire();
     try {
+      this.assertOpen();
       return operation();
     } finally {
       release();
@@ -94,6 +114,12 @@ class DatabaseBoundary {
 
     this.locked = false;
   }
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error('Database is closed');
+    }
+  }
 }
 
 export function openDatabase(path: string) {
@@ -104,10 +130,10 @@ export function openDatabase(path: string) {
   sqlite.enableDefensive(true);
 
   const database = createDatabaseBoundary(sqlite);
-  return { sqlite, database };
+  return { database, close: () => database.close() };
 }
 
-export function createDatabaseBoundary(sqlite: DatabaseSync): DatabaseBoundary {
+function createDatabaseBoundary(sqlite: DatabaseSync): DatabaseBoundary {
   return new DatabaseBoundary(sqlite);
 }
 
