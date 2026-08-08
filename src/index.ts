@@ -43,7 +43,7 @@ const publication = new GiveawayPublicationService(repository, gateway, {
 });
 const cancellation = new GiveawayCancellationService(repository, gateway);
 const management = new GiveawayManagementService(repository);
-const recovery = new GiveawayRecoveryService(repository, gateway);
+const recovery = new GiveawayRecoveryService(repository, gateway, { logger });
 
 registerGiftBotHandlers(bot, {
   teamTelegramIds,

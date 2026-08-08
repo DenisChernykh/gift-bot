@@ -1,7 +1,7 @@
 import type { GiveawayLifecycleRepository, RecoverablePublication } from './ports/giveaway-lifecycle-repository.js';
 import type { TelegramGateway } from './ports/telegram-gateway.js';
 
-type RecoveryDependencies = { now: () => number };
+type RecoveryDependencies = { now: () => number; logger: { error(event: string, fields?: Record<string, unknown>): void } };
 
 export class GiveawayRecoveryService {
   readonly #repository: GiveawayLifecycleRepository;
@@ -15,7 +15,7 @@ export class GiveawayRecoveryService {
   ) {
     this.#repository = repository;
     this.#gateway = gateway;
-    this.#dependencies = { now: Date.now, ...dependencies };
+    this.#dependencies = { now: Date.now, logger: { error: () => undefined }, ...dependencies };
   }
 
   async recoverPublications(): Promise<
@@ -42,6 +42,12 @@ export class GiveawayRecoveryService {
         publicationRunId: publication.runId,
         failure: { stage: 'recovery_unknown_send', errorKind: 'unknown_delivery' },
         now: this.#dependencies.now(),
+      });
+      this.#dependencies.logger.error('publication_failed', {
+        giveawayId: publication.giveawayId,
+        stage: 'recovery_unknown_send',
+        errorKind: 'unknown_delivery',
+        channelIds: publication.deliveries.filter((delivery) => ['sending', 'unknown', 'delivered'].includes(delivery.status)).map((delivery) => delivery.giveawayChannelId),
       });
       return { giveawayId: publication.giveawayId, kind: 'failed' as const };
     }
@@ -80,6 +86,12 @@ export class GiveawayRecoveryService {
       complete,
       ...(!complete ? { failure: { stage: 'recovery_rollback_delete' as const, errorKind: 'delete_failed' } } : {}),
       now: this.#dependencies.now(),
+    });
+    if (!complete) this.#dependencies.logger.error('publication_failed', {
+      giveawayId: publication.giveawayId,
+      stage: 'recovery_rollback_delete',
+      errorKind: 'delete_failed',
+      channelIds: known.map((delivery) => delivery.giveawayChannelId),
     });
     return {
       giveawayId: publication.giveawayId,

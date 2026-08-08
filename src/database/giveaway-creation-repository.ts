@@ -774,7 +774,7 @@ export class SqliteGiveawayCreationRepository
       if (!first) return giveaway;
       const affected = rows.filter((row) =>
         first.stage.includes('unknown')
-          ? ['sending', 'unknown'].includes(row.deliveryStatus ?? '')
+          ? ['sending', 'unknown', 'delivered'].includes(row.deliveryStatus ?? '')
           : first.stage.includes('rollback_delete')
             ? row.deliveryStatus === 'delivered'
             : true,
