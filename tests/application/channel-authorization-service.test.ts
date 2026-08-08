@@ -172,6 +172,23 @@ describe('ChannelAuthorizationService invitation lifecycle', () => {
       ]),
     ).toEqual([{ state: 'revoked', revoked_at: NOW }]);
   });
+
+  it('materializes expiry instead of revoking an invitation after its deadline', async () => {
+    const { database, service, setNow } = await openTestService();
+    const invite = await service.createExternalInvite('giveaway-1');
+    setNow(NOW + 86_400_000);
+
+    expect(await service.revokeExternalInvite(invite.id)).toMatchObject({
+      id: invite.id,
+      state: 'expired',
+      revokedAt: null,
+    });
+    expect(
+      await database.all('select state, revoked_at from channel_invites where id = ?', [
+        invite.id,
+      ]),
+    ).toEqual([{ state: 'expired', revoked_at: null }]);
+  });
 });
 
 describe('ChannelAuthorizationService channel confirmation', () => {

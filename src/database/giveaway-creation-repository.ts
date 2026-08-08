@@ -179,6 +179,12 @@ export class SqliteGiveawayCreationRepository
         throw new Error('Wizard has no materialized giveaway');
       }
 
+      await this.#expireInvitesForGiveaway(
+        transaction,
+        wizard.giveawayId,
+        input.now,
+      );
+
       const [{ count } = { count: 0 }] = await transaction.all<{ count: number }>(
         "select count(*) as count from giveaway_channels where giveaway_id = ? and status = 'confirmed'",
         [wizard.giveawayId],
@@ -267,11 +273,11 @@ export class SqliteGiveawayCreationRepository
       if (row.actorTelegramId !== input.actorTelegramId) {
         throw new Error('Callback action does not belong to this actor');
       }
-      if (row.expiresAt <= input.now) {
+      const alreadyConsumed = row.consumedAt !== null;
+      if (!alreadyConsumed && row.expiresAt <= input.now) {
         throw new Error('Callback action has expired');
       }
 
-      const alreadyConsumed = row.consumedAt !== null;
       if (!alreadyConsumed) {
         await transaction.execute(
           'update callback_actions set consumed_at = ? where token_hash = ?',
@@ -447,7 +453,16 @@ export class SqliteGiveawayCreationRepository
       if (invite.state === 'consumed') {
         throw new Error('Consumed channel invitation cannot be revoked');
       }
-      if (invite.state === 'active') {
+      await this.#expireInvitesForGiveaway(
+        transaction,
+        invite.giveawayId,
+        input.now,
+      );
+      const current = await this.#findInviteById(transaction, input.inviteId);
+      if (!current) {
+        throw new Error('Unknown channel invitation');
+      }
+      if (current.state === 'active') {
         await transaction.execute(
           "update channel_invites set state = 'revoked', revoked_at = ? where id = ?",
           [input.now, input.inviteId],
@@ -699,6 +714,29 @@ export class SqliteGiveawayCreationRepository
       return new Error(`Channel invitation is ${invite.state}`);
     }
     return undefined;
+  }
+
+  async #expireInvitesForGiveaway(
+    database: DatabaseBoundary,
+    giveawayId: string,
+    now: number,
+  ): Promise<void> {
+    await database.execute(
+      `update pending_channel_connections
+          set status = 'superseded', updated_at = ?
+        where giveaway_id = ? and status = 'active'
+          and invite_id in (
+            select id from channel_invites
+             where giveaway_id = ? and state = 'active' and expires_at <= ?
+          )`,
+      [now, giveawayId, giveawayId, now],
+    );
+    await database.execute(
+      `update channel_invites
+          set state = 'expired'
+        where giveaway_id = ? and state = 'active' and expires_at <= ?`,
+      [giveawayId, now],
+    );
   }
 
   async #findInviteByHash(

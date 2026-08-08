@@ -182,4 +182,53 @@ describe('DraftWizardService', () => {
       step: 'preview',
     });
   });
+
+  it('expires an unopened old invite so a consumed replacement does not block preview', async () => {
+    const { database, repository, service } = await openTestApplication();
+    await service.startOrResume(405);
+    await service.submitTitle(405, 'Replacement giveaway');
+    await service.submitWinnerCount(405, 1);
+    await service.submitDeadline(405, '10.08.2026 15:30');
+    await service.submitReferrals(405, false);
+    const wizard = await service.submitContent(405, {
+      kind: 'text',
+      text: 'Replacement content',
+    });
+
+    let sequence = 0;
+    const channels = new ChannelAuthorizationService(repository, {
+      createId: (kind) => `${kind}-replacement-${++sequence}`,
+      now: () => Date.UTC(2026, 7, 8, 7, 0),
+    });
+    const expired = await channels.createExternalInvite(wizard.giveawayId!);
+    await database.execute(
+      'update channel_invites set expires_at = ? where id = ?',
+      [Date.UTC(2026, 7, 8, 7, 0), expired.id],
+    );
+    const replacement = await channels.createExternalInvite(wizard.giveawayId!);
+    await channels.openExternalInvite({
+      token: replacement.token,
+      telegramUserId: 805,
+    });
+    await channels.observeChannel({
+      telegramUserId: 805,
+      telegramChatId: -1405,
+      username: 'replacement_channel',
+      title: 'Replacement Channel',
+      membership: {
+        status: 'administrator',
+        canPostMessages: true,
+        canEditMessages: true,
+        canDeleteMessages: true,
+      },
+    });
+    await channels.confirmChannel({ telegramUserId: 805, telegramChatId: -1405 });
+
+    expect(await service.continueToPreview(405)).toMatchObject({ step: 'preview' });
+    expect(
+      await database.all('select state from channel_invites where id = ?', [
+        expired.id,
+      ]),
+    ).toEqual([{ state: 'expired' }]);
+  });
 });

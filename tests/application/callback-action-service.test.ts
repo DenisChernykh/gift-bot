@@ -90,4 +90,24 @@ describe('CallbackActionService', () => {
       'Callback action has expired',
     );
   });
+
+  it('returns the consumed result when a same-actor replay arrives after expiry', async () => {
+    const { service, setNow } = await openTestService();
+    const issued = await service.issue({
+      actorTelegramId: 503,
+      giveawayId: null,
+      action: 'preview',
+      payload: { page: 2 },
+    });
+    const consumed = await service.consume(issued.token, 503);
+
+    setNow(Date.UTC(2026, 7, 8, 7, 10));
+
+    expect(await service.consume(issued.token, 503)).toMatchObject({
+      action: 'preview',
+      payload: { page: 2 },
+      consumedAt: consumed.consumedAt,
+      alreadyConsumed: true,
+    });
+  });
 });
