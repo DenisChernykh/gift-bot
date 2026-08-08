@@ -10,6 +10,8 @@ export const giveaways = sqliteTable('giveaways', {
   referralsEnabled: integer('referrals_enabled', { mode: 'boolean' }).notNull(),
   contentKind: text('content_kind').notNull(),
   contentText: text('content_text').notNull(),
+  contentFileId: text('content_file_id'),
+  contentEntities: text('content_entities').notNull().default('[]'),
   createdByTelegramId: integer('created_by_telegram_id').notNull(),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),

@@ -1,4 +1,5 @@
 import { fromZonedTime } from 'date-fns-tz';
+import type { MessageEntity } from 'grammy/types';
 
 const MAX_TITLE_LENGTH = 128;
 const MAX_TEXT_LENGTH = 4096;
@@ -6,8 +7,15 @@ const MAX_CAPTION_LENGTH = 1024;
 const PRODUCT_TIME_ZONE = 'Asia/Yekaterinburg';
 
 export type GiveawayContent =
-  | { kind: 'text'; text: string }
-  | { kind: 'photo'; caption: string };
+  | { kind: 'text'; text: string; entities?: GiveawayMessageEntity[] }
+  | {
+      kind: 'photo';
+      caption: string;
+      fileId?: string;
+      entities?: GiveawayMessageEntity[];
+    };
+
+export type GiveawayMessageEntity = MessageEntity;
 
 export function validateGiveawayTitle(value: string): string {
   const title = value.trim();
@@ -70,6 +78,15 @@ export function validateGiveawayContent(content: GiveawayContent): GiveawayConte
   }
 
   return content.kind === 'text'
-    ? { kind: 'text', text: value }
-    : { kind: 'photo', caption: value };
+    ? {
+        kind: 'text',
+        text: value,
+        ...(content.entities ? { entities: content.entities } : {}),
+      }
+    : {
+        kind: 'photo',
+        caption: value,
+        ...(content.fileId ? { fileId: content.fileId } : {}),
+        ...(content.entities ? { entities: content.entities } : {}),
+      };
 }

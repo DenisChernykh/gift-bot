@@ -43,6 +43,12 @@ export class DraftWizardService {
     });
   }
 
+  async findActive(
+    administratorTelegramId: number,
+  ): Promise<ActiveWizard | null> {
+    return this.#repository.findActiveWizard(administratorTelegramId);
+  }
+
   async submitTitle(
     administratorTelegramId: number,
     value: string,

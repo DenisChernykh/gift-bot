@@ -1,0 +1,31 @@
+import type { PublicationGiveaway } from './giveaway-lifecycle-repository.js';
+
+export type GiveawayListItem = {
+  id: string;
+  title: string;
+  state: string;
+  updatedAt: number;
+};
+
+export type JoinLinkTarget = {
+  id: string;
+  title: string;
+  giveawayState: string;
+  tokenState: string;
+};
+
+export type CancellationTarget =
+  | { kind: 'wizard' }
+  | { kind: 'giveaway'; giveawayId: string; title: string }
+  | { kind: 'none' };
+
+export interface GiveawayManagementRepository {
+  listGiveaways(administratorTelegramId: number): Promise<GiveawayListItem[]>;
+  getGiveawaySummary(giveawayId: string): Promise<PublicationGiveaway>;
+  findJoinLinkTarget(tokenHash: string): Promise<JoinLinkTarget | null>;
+  findCancellationTarget(administratorTelegramId: number): Promise<CancellationTarget>;
+  cancelUnmaterializedWizard(input: {
+    administratorTelegramId: number;
+    now: number;
+  }): Promise<boolean>;
+}

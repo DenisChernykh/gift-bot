@@ -11,25 +11,28 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "pnpm lint && pnpm test && pnpm build",
+    "dev": "tsx src/index.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/database/migrate.ts",
     "lint": "eslint .",
+    "start": "node dist/index.js",
     "test": "vitest run"
   },
   "dependencies": {
     "date-fns": "^4.1.0",
     "date-fns-tz": "^3.2.0",
     "dotenv": "^17.2.2",
-    "drizzle-orm": "^0.45.2"
+    "drizzle-orm": "^0.45.2",
+    "grammy": "^1.45.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
     "@types/node": "^24.3.0",
     "drizzle-kit": "^0.31.4",
     "eslint": "^9.33.0",
+    "tsx": "^4.20.4",
     "typescript": "^5.9.2",
     "typescript-eslint": "^8.39.0",
-    "tsx": "^4.20.4",
     "vitest": "^3.2.4"
   }
 }

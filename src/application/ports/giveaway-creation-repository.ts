@@ -37,6 +37,8 @@ export type StartWizardResult = {
 };
 
 export interface GiveawayCreationRepository {
+  findActiveWizard(administratorTelegramId: number): Promise<ActiveWizard | null>;
+
   startOrResumeWizard(input: {
     id: string;
     administratorTelegramId: number;

@@ -131,6 +131,35 @@ describe('DraftWizardService', () => {
     ]);
   });
 
+  it('persists Telegram photo file_id and caption entities without rewriting them', async () => {
+    const { database, service } = await openTestApplication();
+    await service.startOrResume(304);
+    await service.submitTitle(304, 'Photo giveaway');
+    await service.submitWinnerCount(304, 1);
+    await service.submitDeadline(304, '10.08.2026 15:30');
+    await service.submitReferrals(304, false);
+
+    await service.submitContent(304, {
+      kind: 'photo',
+      fileId: 'telegram-photo-file-id',
+      caption: 'Photo conditions',
+      entities: [{ type: 'bold', offset: 0, length: 5 }],
+    });
+
+    expect(
+      await database.all(
+        `select content_file_id, content_entities
+           from giveaways where created_by_telegram_id = ?`,
+        [304],
+      ),
+    ).toEqual([
+      {
+        content_file_id: 'telegram-photo-file-id',
+        content_entities: '[{"type":"bold","offset":0,"length":5}]',
+      },
+    ]);
+  });
+
   it('advances from channels to preview only after a channel is confirmed', async () => {
     const { repository, service } = await openTestApplication();
     await service.startOrResume(404);
