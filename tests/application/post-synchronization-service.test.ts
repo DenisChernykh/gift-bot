@@ -180,6 +180,34 @@ describe('giveaway post synchronization', () => {
     expect(gateway.maximumConcurrentEdits).toBe(1);
   });
 
+  it('preserves the counter throttle when recovering an interrupted claim', async () => {
+    const { database, gateway, repository, service, advanceTime } =
+      await openSynchronization();
+
+    expect(await repository.claimTask('counter-1', NOW)).not.toBeNull();
+    advanceTime(10_000);
+    await service.recoverInterrupted();
+
+    expect(await service.synchronizePending()).toBe(0);
+    expect(gateway.edits).toEqual([]);
+    expect(
+      await database.all(
+        `select status, available_at, last_error_kind
+           from sync_tasks where id = 'counter-1'`,
+      ),
+    ).toEqual([
+      {
+        status: 'pending',
+        available_at: NOW + 60_000,
+        last_error_kind: 'interrupted',
+      },
+    ]);
+
+    advanceTime(50_000);
+    expect(await service.synchronizePending()).toBe(1);
+    expect(gateway.edits).toHaveLength(1);
+  });
+
   it('completes successful channels while retaining only the failed channel for retry', async () => {
     const { database, gateway, service } = await openSynchronization();
     await database.execute(
@@ -222,7 +250,7 @@ describe('giveaway post synchronization', () => {
         id: 'counter-1',
         status: 'completed',
         attempts: 1,
-        available_at: NOW,
+        available_at: NOW + 60_000,
       },
       {
         id: 'counter-2',

@@ -19,7 +19,11 @@ export class SqlitePostSynchronizationRepository
   async recoverInterrupted(now: number): Promise<void> {
     await this.#database.execute(
       `update sync_tasks
-          set status = 'pending', available_at = min(available_at, ?),
+          set status = 'pending',
+              available_at = case
+                when task_type = 'participant_count' then available_at
+                else min(available_at, ?)
+              end,
               last_error_kind = 'interrupted', updated_at = ?
         where status = 'processing'
           and task_type in ('cancel_message', 'participant_count')`,
@@ -53,9 +57,16 @@ export class SqlitePostSynchronizationRepository
       const task = rows[0];
       if (!task) return null;
       await transaction.execute(
-        `update sync_tasks set status = 'processing', updated_at = ?
+        `update sync_tasks
+            set status = 'processing',
+                available_at = case
+                  when task_type = 'participant_count'
+                    then max(available_at, ?)
+                  else available_at
+                end,
+                updated_at = ?
           where id = ? and status = 'pending'`,
-        [now, id],
+        [now + 60_000, now, id],
       );
       return task;
     });

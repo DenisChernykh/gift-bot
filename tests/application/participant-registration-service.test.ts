@@ -243,6 +243,32 @@ describe('participant registration', () => {
     expect(await database.all('select id from participants')).toEqual([]);
   });
 
+  it('records rights-loss alerts for every affected channel', async () => {
+    const { database, gateway, service } = await openApplication({
+      channels: [-1001, -1002],
+    });
+    gateway.botAdministrator.set(-1001, false);
+    gateway.botAdministrator.set(-1002, false);
+
+    const result = await service.joinWithToken({
+      kind: 'join',
+      token: 'join-token',
+      user: { telegramUserId: 900, username: 'guest', displayName: 'Guest' },
+    });
+
+    expect(result).toMatchObject({ kind: 'retry_later' });
+    expect(
+      await database.all(
+        `select giveaway_channel_id, state
+           from channel_health_alerts order by giveaway_channel_id`,
+      ),
+    ).toEqual([
+      { giveaway_channel_id: 'channel-1', state: 'active' },
+      { giveaway_channel_id: 'channel-2', state: 'active' },
+    ]);
+    expect(await database.all('select id from participants')).toEqual([]);
+  });
+
   it('closes the active rights alert after a later successful bot check', async () => {
     const { database, gateway, service } = await openApplication();
     gateway.botAdministrator.set(-1001, false);

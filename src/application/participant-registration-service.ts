@@ -129,6 +129,7 @@ export class ParticipantRegistrationService {
     }
 
     const missingChannels: ParticipantEntryTarget['channels'] = [];
+    let botRightsLost = false;
     for (const channel of target.channels) {
       try {
         const snapshot = await this.#gateway.getChannelSnapshot(
@@ -140,12 +141,8 @@ export class ParticipantRegistrationService {
             giveawayChannelId: channel.id,
             now: this.#dependencies.now(),
           });
-          return {
-            kind: 'retry_later',
-            giveawayId: target.giveawayId,
-            inviterParticipantId: target.inviterParticipantId,
-            retryAfterMs: null,
-          };
+          botRightsLost = true;
+          continue;
         }
         await this.#repository.resolveBotRightsLoss({
           giveawayId: target.giveawayId,
@@ -167,6 +164,14 @@ export class ParticipantRegistrationService {
           retryAfterMs: telegramRetryAfter(error),
         };
       }
+    }
+    if (botRightsLost) {
+      return {
+        kind: 'retry_later',
+        giveawayId: target.giveawayId,
+        inviterParticipantId: target.inviterParticipantId,
+        retryAfterMs: null,
+      };
     }
     if (missingChannels.length > 0) {
       return {
