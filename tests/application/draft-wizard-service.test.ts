@@ -142,20 +142,21 @@ describe('DraftWizardService', () => {
     await service.submitContent(304, {
       kind: 'photo',
       fileId: 'telegram-photo-file-id',
-      caption: 'Photo conditions',
-      entities: [{ type: 'bold', offset: 0, length: 5 }],
+      caption: '  Photo conditions',
+      entities: [{ type: 'bold', offset: 2, length: 5 }],
     });
 
     expect(
       await database.all(
-        `select content_file_id, content_entities
+        `select content_text, content_file_id, content_entities
            from giveaways where created_by_telegram_id = ?`,
         [304],
       ),
     ).toEqual([
       {
+        content_text: '  Photo conditions',
         content_file_id: 'telegram-photo-file-id',
-        content_entities: '[{"type":"bold","offset":0,"length":5}]',
+        content_entities: '[{"type":"bold","offset":2,"length":5}]',
       },
     ]);
   });
@@ -186,6 +187,7 @@ describe('DraftWizardService', () => {
     });
     await channels.observeChannel({
       telegramUserId: 404,
+      ownConnectionAllowed: true,
       telegramChatId: -1404,
       username: 'preview_channel',
       title: 'Preview Channel',
@@ -196,7 +198,11 @@ describe('DraftWizardService', () => {
         canDeleteMessages: true,
       },
     });
-    await channels.confirmChannel({ telegramUserId: 404, telegramChatId: -1404 });
+    await channels.confirmChannel({
+      telegramUserId: 404,
+      telegramChatId: -1404,
+      mode: 'own',
+    });
 
     const unconfirmed = await channels.createExternalInvite(
       channelsStep.giveawayId!,
@@ -241,6 +247,7 @@ describe('DraftWizardService', () => {
     });
     await channels.observeChannel({
       telegramUserId: 805,
+      ownConnectionAllowed: false,
       telegramChatId: -1405,
       username: 'replacement_channel',
       title: 'Replacement Channel',
@@ -251,7 +258,11 @@ describe('DraftWizardService', () => {
         canDeleteMessages: true,
       },
     });
-    await channels.confirmChannel({ telegramUserId: 805, telegramChatId: -1405 });
+    await channels.confirmChannel({
+      telegramUserId: 805,
+      telegramChatId: -1405,
+      mode: 'external',
+    });
 
     expect(await service.continueToPreview(405)).toMatchObject({ step: 'preview' });
     expect(

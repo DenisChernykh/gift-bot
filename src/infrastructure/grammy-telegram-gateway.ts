@@ -1,6 +1,5 @@
 import { GrammyError, HttpError, type Api } from 'grammy';
 
-import type { TelegramChannelMembership } from '../domain/channel-rights.js';
 import {
   TelegramDeliveryError,
   type TelegramCancelledMessage,
@@ -47,18 +46,28 @@ export class GrammyTelegramGateway implements TelegramGateway {
     this.#botTelegramId = botTelegramId;
   }
 
-  async getChannelMembership(chatId: number): Promise<TelegramChannelMembership> {
-    const member = await this.#call(() =>
-      this.#api.getChatMember(chatId, this.#botTelegramId),
+  async getChannelSnapshot(chatId: number) {
+    const [chat, member] = await this.#call(() =>
+      Promise.all([
+        this.#api.getChat(chatId),
+        this.#api.getChatMember(chatId, this.#botTelegramId),
+      ]),
     );
     return {
-      status: member.status,
-      canPostMessages:
-        member.status === 'administrator' && (member.can_post_messages ?? false),
-      canEditMessages:
-        member.status === 'administrator' && (member.can_edit_messages ?? false),
-      canDeleteMessages:
-        member.status === 'administrator' && (member.can_delete_messages ?? false),
+      username: 'username' in chat ? (chat.username ?? null) : null,
+      title: 'title' in chat ? (chat.title ?? '') : '',
+      membership: {
+        status: member.status,
+        canPostMessages:
+          member.status === 'administrator' &&
+          (member.can_post_messages ?? false),
+        canEditMessages:
+          member.status === 'administrator' &&
+          (member.can_edit_messages ?? false),
+        canDeleteMessages:
+          member.status === 'administrator' &&
+          (member.can_delete_messages ?? false),
+      },
     };
   }
 

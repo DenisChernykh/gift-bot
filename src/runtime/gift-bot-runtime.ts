@@ -1,3 +1,5 @@
+import type { Context, MiddlewareFn } from 'grammy';
+
 import type { SafeLogger } from './logger.js';
 
 type BotLifecycle = {
@@ -13,18 +15,59 @@ type CancellationSynchronization = {
   retryPendingSynchronization(): Promise<number>;
 };
 
+type UpdateDrain = {
+  stopAccepting(): void;
+  waitForIdle(): Promise<void>;
+};
+
 type RuntimeDependencies = {
   logger: SafeLogger;
   schedule: (operation: () => void, milliseconds: number) => unknown;
   clearSchedule: (handle: unknown) => void;
   synchronizationIntervalMs: number;
+  updateDrain: UpdateDrain;
 };
 
 const defaultDependencies: Omit<RuntimeDependencies, 'logger'> = {
   schedule: (operation, milliseconds) => setInterval(operation, milliseconds),
   clearSchedule: (handle) => clearInterval(handle as NodeJS.Timeout),
   synchronizationIntervalMs: 60_000,
+  updateDrain: {
+    stopAccepting: () => undefined,
+    waitForIdle: async () => undefined,
+  },
 };
+
+export class InFlightUpdateTracker implements UpdateDrain {
+  #accepting = true;
+  #inFlight = 0;
+  readonly #idleWaiters = new Set<() => void>();
+
+  middleware<C extends Context>(): MiddlewareFn<C> {
+    return async (_context, next) => {
+      if (!this.#accepting) return;
+      this.#inFlight += 1;
+      try {
+        await next();
+      } finally {
+        this.#inFlight -= 1;
+        if (this.#inFlight === 0) {
+          for (const resolve of this.#idleWaiters) resolve();
+          this.#idleWaiters.clear();
+        }
+      }
+    };
+  }
+
+  stopAccepting(): void {
+    this.#accepting = false;
+  }
+
+  async waitForIdle(): Promise<void> {
+    if (this.#inFlight === 0) return;
+    await new Promise<void>((resolve) => this.#idleWaiters.add(resolve));
+  }
+}
 
 export class GiftBotRuntime {
   readonly #bot: BotLifecycle;
@@ -71,7 +114,10 @@ export class GiftBotRuntime {
     this.#stopped = true;
     if (this.#timer !== undefined) this.#dependencies.clearSchedule(this.#timer);
     this.#dependencies.logger.info('bot_stopping', { signal });
-    await this.#bot.stop();
+    const stopPolling = Promise.resolve(this.#bot.stop());
+    this.#dependencies.updateDrain.stopAccepting();
+    await stopPolling;
+    await this.#dependencies.updateDrain.waitForIdle();
     await this.#closeDatabase();
     this.#dependencies.logger.info('bot_stopped', { signal });
   }

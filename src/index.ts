@@ -16,7 +16,10 @@ import { openDatabase } from './database/client.js';
 import { SqliteGiveawayCreationRepository } from './database/giveaway-creation-repository.js';
 import { migrateDatabase } from './database/migrate.js';
 import { GrammyTelegramGateway } from './infrastructure/grammy-telegram-gateway.js';
-import { GiftBotRuntime } from './runtime/gift-bot-runtime.js';
+import {
+  GiftBotRuntime,
+  InFlightUpdateTracker,
+} from './runtime/gift-bot-runtime.js';
 import { createJsonLogger } from './runtime/logger.js';
 import { registerGiftBotHandlers } from './telegram/gift-bot-adapter.js';
 
@@ -33,6 +36,8 @@ await migrateDatabase(opened.database);
 const repository = new SqliteGiveawayCreationRepository(opened.database);
 const bot = new Bot(botToken);
 await bot.init();
+const inFlightUpdates = new InFlightUpdateTracker();
+bot.use(inFlightUpdates.middleware());
 const gateway = new GrammyTelegramGateway(bot.api, bot.botInfo.id);
 const wizard = new DraftWizardService(repository);
 const channels = new ChannelAuthorizationService(repository);
@@ -82,7 +87,7 @@ const runtime = new GiftBotRuntime(
   recovery,
   cancellation,
   opened.close,
-  { logger },
+  { logger, updateDrain: inFlightUpdates },
 );
 
 process.once('SIGINT', () => void runtime.stop('SIGINT'));

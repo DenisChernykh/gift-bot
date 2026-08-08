@@ -33,12 +33,16 @@ class FakeTelegramGateway implements TelegramGateway {
   deleteResults: Array<void | Error> = [];
   beforeEdit?: (input: TelegramCancelledMessage) => Promise<void>;
 
-  async getChannelMembership() {
+  async getChannelSnapshot() {
     return {
-      status: 'administrator',
-      canPostMessages: true,
-      canEditMessages: true,
-      canDeleteMessages: true,
+      username: 'recovery_channel',
+      title: 'Recovery Channel',
+      membership: {
+        status: 'administrator',
+        canPostMessages: true,
+        canEditMessages: true,
+        canDeleteMessages: true,
+      },
     };
   }
 
@@ -146,7 +150,7 @@ async function seedPublishingRun(
 
 async function seedGiveaway(
   database: DatabaseBoundary,
-  state: 'draft' | 'active' | 'publishing',
+  state: 'draft' | 'active' | 'publishing' | 'failed',
   channelCount: number,
 ) {
   await database.execute(
@@ -176,18 +180,39 @@ async function seedGiveaway(
 }
 
 describe('GiveawayRecoveryService', () => {
-  it('activates a publishing giveaway when every delivery was saved before startup', async () => {
-    const { database, recovery } = await openLifecycleApplication();
+  it('fails closed when every send was saved but activation was not committed before startup', async () => {
+    const { database, gateway, recovery } = await openLifecycleApplication();
     await seedPublishingRun(database, ['delivered', 'delivered']);
+    await database.execute(
+      `insert into wizard_sessions (
+         id, administrator_telegram_id, giveaway_id, step, status,
+         draft_data, created_at, updated_at
+       ) values ('wizard-recovery', 700, 'giveaway-1', 'preview', 'active', '{}', ?, ?)`,
+      [NOW, NOW],
+    );
 
     expect(await recovery.recoverPublications()).toEqual([
-      { giveawayId: 'giveaway-1', kind: 'activated' },
+      { giveawayId: 'giveaway-1', kind: 'failed' },
     ]);
+    expect(gateway.operations).toEqual([]);
     expect(await database.all('select state from giveaways')).toEqual([
-      { state: 'active' },
+      { state: 'failed' },
     ]);
     expect(await database.all('select state from join_tokens')).toEqual([
-      { state: 'active' },
+      { state: 'revoked' },
+    ]);
+    expect(
+      await database.all(
+        'select failure_stage, failure_error_kind from publication_runs',
+      ),
+    ).toEqual([
+      {
+        failure_stage: 'activation_uncertain',
+        failure_error_kind: 'telegram_posts_unverified',
+      },
+    ]);
+    expect(await database.all('select status from wizard_sessions')).toEqual([
+      { status: 'failed' },
     ]);
   });
 
@@ -290,6 +315,39 @@ describe('GiveawayRecoveryService', () => {
 });
 
 describe('GiveawayCancellationService', () => {
+  it('cancels a failed giveaway and synchronizes every known message from its bound failed run', async () => {
+    const { database, gateway, cancellation } = await openLifecycleApplication();
+    await seedGiveaway(database, 'failed', 1);
+    await database.execute(
+      `insert into publication_runs (
+         id, giveaway_id, status, failure_stage, failure_error_kind,
+         started_at, finished_at
+       ) values ('run-failed', 'giveaway-1', 'failed', 'activation_uncertain',
+                 'telegram_posts_unverified', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      "update giveaways set failure_run_id = 'run-failed' where id = 'giveaway-1'",
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('delivery-failed', 'run-failed', 'channel-1', 'delivered',
+                 190, 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+
+    expect(await cancellation.cancel('giveaway-1')).toMatchObject({
+      kind: 'cancelled',
+      pendingSyncTasks: 0,
+    });
+    expect(gateway.operations).toEqual(['edit:-2001:190']);
+    expect(await database.all('select state from giveaways')).toEqual([
+      { state: 'cancelled' },
+    ]);
+  });
+
   it('persists cancelled and durable sync tasks before attempting Telegram edits', async () => {
     const { database, gateway, cancellation } = await openLifecycleApplication();
     await seedGiveaway(database, 'active', 2);

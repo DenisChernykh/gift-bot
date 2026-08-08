@@ -58,41 +58,67 @@ export function registerGiftBotHandlers(
   bot.command('giveaways', async (context) => {
     if (!(await requireAdministrator(context, dependencies))) return;
     const giveaways = await dependencies.management.listGiveaways(context.from!.id);
-    await context.reply(
-      giveaways.length === 0
-        ? 'Сохранённых розыгрышей пока нет.'
-        : giveaways.map(formatGiveawayListItem).join('\n\n'),
-    );
+    if (giveaways.length === 0) {
+      await context.reply('Сохранённых розыгрышей пока нет.');
+      return;
+    }
+    for (const giveaway of giveaways) {
+      const cancellable = ['draft', 'active', 'failed'].includes(giveaway.state);
+      const replyMarkup = cancellable
+        ? new InlineKeyboard().text(
+            'Отменить',
+            await issueCancellationSelection(
+              dependencies,
+              context.from!.id,
+              {
+                kind: 'giveaway',
+                giveawayId: giveaway.id,
+                title: giveaway.title,
+                state: giveaway.state as 'draft' | 'active' | 'failed',
+              },
+            ),
+          )
+        : undefined;
+      await context.reply(formatGiveawayListItem(giveaway), {
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+    }
   });
 
   bot.command('cancel', async (context) => {
     if (!(await requireAdministrator(context, dependencies))) return;
     await safelyReply(context, async () => {
-      const target = await dependencies.management.findCancellationTarget(
+      const targets = await dependencies.management.listCancellationTargets(
         context.from!.id,
       );
-      if (target.kind === 'none') {
+      if (targets.length === 0) {
         await context.reply('Нет розыгрыша или мастера для отмены.');
         return;
       }
-      const action = await dependencies.callbacks.issue({
-        actorTelegramId: context.from!.id,
-        giveawayId: target.kind === 'giveaway' ? target.giveawayId : null,
-        action: target.kind === 'giveaway' ? 'cancel_giveaway' : 'cancel_wizard',
-        payload:
-          target.kind === 'giveaway' ? { giveawayId: target.giveawayId } : {},
+      if (targets.length === 1) {
+        await replyCancellationConfirmation(
+          context,
+          targets[0]!,
+          dependencies,
+        );
+        return;
+      }
+      const keyboard = new InlineKeyboard();
+      for (const target of targets) {
+        keyboard
+          .text(
+            target.kind === 'giveaway' ? target.title : 'Текущий мастер',
+            await issueCancellationSelection(
+              dependencies,
+              context.from!.id,
+              target,
+            ),
+          )
+          .row();
+      }
+      await context.reply('Выберите розыгрыш для отмены.', {
+        reply_markup: keyboard,
       });
-      await context.reply(
-        target.kind === 'giveaway'
-          ? `Отменить розыгрыш «${target.title}»?`
-          : 'Отменить текущий мастер?',
-        {
-          reply_markup: new InlineKeyboard().text(
-            'Подтвердить отмену',
-            `${ADMIN_CALLBACK_PREFIX}${action.token}`,
-          ),
-        },
-      );
     });
   });
 
@@ -114,7 +140,10 @@ export function registerGiftBotHandlers(
     try {
       const action = await dependencies.callbacks.consume(token, context.from.id);
       if (action.alreadyConsumed) {
-        await context.answerCallbackQuery({ text: 'Уже обработано.' });
+        const text = action.giveawayId
+          ? `Уже обработано. Текущее состояние: ${(await dependencies.management.getGiveawaySummary(action.giveawayId)).state}.`
+          : 'Уже обработано.';
+        await context.answerCallbackQuery({ text });
         return;
       }
       await handleCallbackAction(context, action, dependencies);
@@ -131,6 +160,7 @@ export function registerGiftBotHandlers(
     try {
       const observed = await dependencies.channels.observeChannel({
         telegramUserId: update.from.id,
+        ownConnectionAllowed: dependencies.teamTelegramIds.has(update.from.id),
         telegramChatId: update.chat.id,
         username: update.chat.username ?? null,
         title: update.chat.title,
@@ -153,8 +183,11 @@ export function registerGiftBotHandlers(
       }
       const action = await dependencies.callbacks.issue({
         actorTelegramId: update.from.id,
-        giveawayId: null,
-        action: 'confirm_channel',
+        giveawayId: observed.giveawayId,
+        action:
+          observed.mode === 'own'
+            ? 'confirm_own_channel'
+            : 'confirm_external_channel',
         payload: { telegramChatId: update.chat.id },
       });
       await context.api.sendMessage(
@@ -163,7 +196,7 @@ export function registerGiftBotHandlers(
         {
           reply_markup: new InlineKeyboard().text(
             'Подтвердить канал',
-            `${EXTERNAL_CALLBACK_PREFIX}${action.token}`,
+            `${observed.mode === 'own' ? ADMIN_CALLBACK_PREFIX : EXTERNAL_CALLBACK_PREFIX}${action.token}`,
           ),
         },
       );
@@ -248,7 +281,7 @@ async function handleExternalInviteStart(
         actorTelegramId: context.from!.id,
         giveawayId: connection.requested.giveawayId,
         action: 'switch_external_invite',
-        payload: { token },
+        payload: { inviteId: connection.requested.inviteId },
       });
       await context.reply('У вас уже есть другое подключение. Переключиться?', {
         reply_markup: new InlineKeyboard().text(
@@ -261,7 +294,12 @@ async function handleExternalInviteStart(
     const summary = await dependencies.management.getGiveawaySummary(
       connection.context.giveawayId,
     );
-    await replyStartChannelLink(context, dependencies, summary.title);
+    await replyStartChannelLink(
+      context,
+      dependencies,
+      summary.title,
+      connection.inviteExpiresAt,
+    );
   });
 }
 
@@ -316,16 +354,20 @@ async function handleCallbackAction(
       return;
     }
     case 'switch_external_invite': {
-      const result = await dependencies.channels.openExternalInvite({
-        token: stringPayload(action.payload, 'token'),
+      const result = await dependencies.channels.switchExternalInvite({
+        inviteId: stringPayload(action.payload, 'inviteId'),
         telegramUserId: actorTelegramId,
-        confirmSwitch: true,
       });
       if (result.kind === 'ready') {
         const summary = await dependencies.management.getGiveawaySummary(
           result.context.giveawayId,
         );
-        await replyStartChannelLink(context, dependencies, summary.title);
+        await replyStartChannelLink(
+          context,
+          dependencies,
+          summary.title,
+          result.inviteExpiresAt,
+        );
       }
       return;
     }
@@ -337,16 +379,27 @@ async function handleCallbackAction(
       );
       return;
     }
-    case 'confirm_channel': {
+    case 'confirm_own_channel': {
+      if (!dependencies.teamTelegramIds.has(actorTelegramId)) {
+        throw new Error('Administrator is no longer allowlisted');
+      }
       await dependencies.channels.confirmChannel({
         telegramUserId: actorTelegramId,
         telegramChatId: numberPayload(action.payload, 'telegramChatId'),
+        mode: 'own',
       });
       await context.reply('Канал подключён только к этому розыгрышу.');
-      if (dependencies.teamTelegramIds.has(actorTelegramId)) {
-        const wizard = await dependencies.wizard.findActive(actorTelegramId);
-        if (wizard) await replyWizardPrompt(context, wizard, dependencies);
-      }
+      const wizard = await dependencies.wizard.findActive(actorTelegramId);
+      if (wizard) await replyWizardPrompt(context, wizard, dependencies);
+      return;
+    }
+    case 'confirm_external_channel': {
+      await dependencies.channels.confirmChannel({
+        telegramUserId: actorTelegramId,
+        telegramChatId: numberPayload(action.payload, 'telegramChatId'),
+        mode: 'external',
+      });
+      await context.reply('Канал подключён только к этому розыгрышу.');
       return;
     }
     case 'continue_preview': {
@@ -384,6 +437,30 @@ async function handleCallbackAction(
       }
       return;
     }
+    case 'request_cancel_giveaway': {
+      const giveawayId = stringPayload(action.payload, 'giveawayId');
+      const giveaway = await dependencies.management.getGiveawaySummary(
+        giveawayId,
+      );
+      await replyCancellationConfirmation(
+        context,
+        {
+          kind: 'giveaway',
+          giveawayId,
+          title: giveaway.title,
+          state: giveaway.state as 'draft' | 'active' | 'failed',
+        },
+        dependencies,
+      );
+      return;
+    }
+    case 'request_cancel_wizard':
+      await replyCancellationConfirmation(
+        context,
+        { kind: 'wizard' },
+        dependencies,
+      );
+      return;
     case 'cancel_giveaway': {
       const result = await dependencies.cancellation.cancel(
         stringPayload(action.payload, 'giveawayId'),
@@ -399,6 +476,53 @@ async function handleCallbackAction(
       await dependencies.management.cancelUnmaterializedWizard(actorTelegramId);
       await context.reply('Текущий мастер отменён.');
   }
+}
+
+type CancellationSelection = Awaited<
+  ReturnType<GiveawayManagementService['listCancellationTargets']>
+>[number];
+
+async function issueCancellationSelection(
+  dependencies: GiftBotHandlersDependencies,
+  actorTelegramId: number,
+  target: CancellationSelection,
+) {
+  const action = await dependencies.callbacks.issue({
+    actorTelegramId,
+    giveawayId: target.kind === 'giveaway' ? target.giveawayId : null,
+    action:
+      target.kind === 'giveaway'
+        ? 'request_cancel_giveaway'
+        : 'request_cancel_wizard',
+    payload:
+      target.kind === 'giveaway' ? { giveawayId: target.giveawayId } : {},
+  });
+  return `${ADMIN_CALLBACK_PREFIX}${action.token}`;
+}
+
+async function replyCancellationConfirmation(
+  context: Context,
+  target: CancellationSelection,
+  dependencies: GiftBotHandlersDependencies,
+) {
+  const action = await dependencies.callbacks.issue({
+    actorTelegramId: context.from!.id,
+    giveawayId: target.kind === 'giveaway' ? target.giveawayId : null,
+    action: target.kind === 'giveaway' ? 'cancel_giveaway' : 'cancel_wizard',
+    payload:
+      target.kind === 'giveaway' ? { giveawayId: target.giveawayId } : {},
+  });
+  await context.reply(
+    target.kind === 'giveaway'
+      ? `Отменить розыгрыш «${target.title}»?`
+      : 'Отменить текущий мастер?',
+    {
+      reply_markup: new InlineKeyboard().text(
+        'Подтвердить отмену',
+        `${ADMIN_CALLBACK_PREFIX}${action.token}`,
+      ),
+    },
+  );
 }
 
 async function beginOwnChannelConnection(
@@ -434,9 +558,10 @@ async function replyStartChannelLink(
   context: Context,
   dependencies: GiftBotHandlersDependencies,
   giveawayTitle?: string,
+  inviteExpiresAt?: number | null,
 ) {
   await context.reply(
-    `${giveawayTitle ? `Розыгрыш «${giveawayTitle}». ` : ''}Добавьте бота администратором публичного канала с правами публикации, редактирования и удаления.`,
+    `${giveawayTitle ? `Розыгрыш «${giveawayTitle}». ` : ''}${inviteExpiresAt !== undefined && inviteExpiresAt !== null ? `Приглашение истекает ${new Date(inviteExpiresAt).toISOString()}. ` : ''}Добавьте бота администратором публичного канала с правами публикации, редактирования и удаления.`,
     {
       reply_markup: new InlineKeyboard().url(
         'Выбрать канал',
@@ -518,12 +643,14 @@ async function replyWizardPrompt(
       if (giveaway.content.kind === 'photo' && giveaway.content.fileId) {
         await context.replyWithPhoto(giveaway.content.fileId, {
           caption: rendered,
-          reply_markup: replyMarkup,
         });
-        await context.reply(`Каналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`);
-        return;
+      } else {
+        await context.reply(rendered);
       }
-      await context.reply(`${rendered}\n\nКаналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`, { reply_markup: replyMarkup });
+      await context.reply(
+        `Каналы:\n${channelList}\n\nПосле запуска условия нельзя изменить.`,
+        { reply_markup: replyMarkup },
+      );
     }
   }
 }

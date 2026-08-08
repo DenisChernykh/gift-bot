@@ -70,10 +70,10 @@ export function parseGiveawayDeadline(value: string, now: number): number {
 }
 
 export function validateGiveawayContent(content: GiveawayContent): GiveawayContent {
-  const value = content.kind === 'text' ? content.text.trim() : content.caption.trim();
+  const value = content.kind === 'text' ? content.text : content.caption;
   const maximumLength = content.kind === 'text' ? MAX_TEXT_LENGTH : MAX_CAPTION_LENGTH;
 
-  if (value.length === 0 || value.length > maximumLength) {
+  if (value.trim().length === 0 || value.length > maximumLength) {
     throw new Error('Giveaway content is empty or exceeds Telegram limits');
   }
 

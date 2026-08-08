@@ -71,28 +71,54 @@ export class GiveawayPublicationService {
       throw new Error('At least one confirmed channel is required');
     }
 
+    const refreshedChannels: PublicationGiveaway['channels'] = [];
     for (const channel of giveaway.channels) {
-      const membership = await this.#gateway.getChannelMembership(
+      const snapshot = await this.#gateway.getChannelSnapshot(
         channel.telegramChatId,
       );
-      if (!hasPublicationAdministratorRights(membership)) {
+      const username = snapshot.username
+        ?.trim()
+        .replace(/^@/, '')
+        .toLowerCase();
+      if (!username) {
         const diagnostic: PublicationFailureDiagnostic = {
           stage: 'preflight',
-          errorKind: 'missing_publication_rights',
+          errorKind: 'missing_public_username',
           channel,
         };
         this.#logFailure(giveawayId, diagnostic);
         throw new PublicationFailureError(diagnostic);
       }
+      const refreshedChannel = {
+        ...channel,
+        username,
+        title: snapshot.title,
+      };
+      if (!hasPublicationAdministratorRights(snapshot.membership)) {
+        const diagnostic: PublicationFailureDiagnostic = {
+          stage: 'preflight',
+          errorKind: 'missing_publication_rights',
+          channel: refreshedChannel,
+        };
+        this.#logFailure(giveawayId, diagnostic);
+        throw new PublicationFailureError(diagnostic);
+      }
+      refreshedChannels.push(refreshedChannel);
     }
+    await this.#repository.refreshPublicationChannels({
+      giveawayId,
+      channels: refreshedChannels,
+      now: this.#dependencies.now(),
+    });
+    const refreshedGiveaway = { ...giveaway, channels: refreshedChannels };
 
     const publicationRunId = this.#dependencies.createId('publication_run');
-    const deliveries = giveaway.channels.map((channel) => ({
+    const deliveries = refreshedGiveaway.channels.map((channel) => ({
       id: this.#dependencies.createId('delivery'),
       giveawayChannelId: channel.id,
     }));
     const joinToken = this.#dependencies.createToken();
-    const message = this.#renderMessage(giveaway, joinToken.token);
+    const message = this.#renderMessage(refreshedGiveaway, joinToken.token);
     const begin = await this.#repository.beginPublication({
       giveawayId,
       publicationRunId,
@@ -112,7 +138,7 @@ export class GiveawayPublicationService {
     );
     const knownDeliveries: PublicationDelivery[] = [];
 
-    for (const channel of giveaway.channels) {
+    for (const channel of refreshedGiveaway.channels) {
       const delivery = deliveryByChannelId.get(channel.id);
       if (!delivery) throw new Error('Missing publication delivery intent');
 
@@ -269,7 +295,9 @@ export class PublicationFailureError extends Error {
   constructor(readonly diagnostic: PublicationFailureDiagnostic) {
     super(
       diagnostic.channel
-        ? `Channel @${diagnostic.channel.username} is missing publication rights`
+        ? diagnostic.errorKind === 'missing_public_username'
+          ? `Channel ${diagnostic.channel.telegramChatId} no longer has a public username`
+          : `Channel @${diagnostic.channel.username} is missing publication rights`
         : `Publication failed at ${diagnostic.stage}`,
     );
   }

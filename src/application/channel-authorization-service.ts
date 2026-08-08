@@ -77,6 +77,18 @@ export class ChannelAuthorizationService {
     });
   }
 
+  async switchExternalInvite(input: {
+    inviteId: string;
+    telegramUserId: number;
+  }) {
+    return this.#repository.switchExternalInvite({
+      id: this.#dependencies.createId('connection'),
+      inviteId: input.inviteId,
+      telegramUserId: input.telegramUserId,
+      now: this.#dependencies.now(),
+    });
+  }
+
   async revokeExternalInvite(inviteId: string): Promise<ChannelInvitation> {
     return this.#repository.revokeExternalInvite({
       inviteId,
@@ -86,6 +98,7 @@ export class ChannelAuthorizationService {
 
   async observeChannel(input: {
     telegramUserId: number;
+    ownConnectionAllowed: boolean;
     telegramChatId: number;
     username: string | null;
     title: string;
@@ -101,6 +114,7 @@ export class ChannelAuthorizationService {
 
     return this.#repository.storeChannelCandidate({
       telegramUserId: input.telegramUserId,
+      ownConnectionAllowed: input.ownConnectionAllowed,
       candidate: {
         telegramChatId: input.telegramChatId,
         username,
@@ -113,11 +127,13 @@ export class ChannelAuthorizationService {
   async confirmChannel(input: {
     telegramUserId: number;
     telegramChatId: number;
+    mode: 'own' | 'external';
   }) {
     return this.#repository.confirmChannel({
       id: this.#dependencies.createId('channel'),
       telegramUserId: input.telegramUserId,
       telegramChatId: input.telegramChatId,
+      mode: input.mode,
       now: this.#dependencies.now(),
     });
   }

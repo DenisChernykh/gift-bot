@@ -18,7 +18,7 @@ import type {
   TelegramGiveawayMessage,
 } from '../../src/application/ports/telegram-gateway.js';
 import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
-import { openDatabase } from '../../src/database/client.js';
+import { openDatabase, type DatabaseBoundary } from '../../src/database/client.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
 import { hashToken } from '../../src/domain/tokens.js';
@@ -76,14 +76,22 @@ class FakeTelegramApi {
 class FakePublicationGateway implements TelegramGateway {
   readonly operations: string[] = [];
   sendResults: Array<number | Error> = [];
+  readonly metadata = new Map<number, { username: string | null; title: string }>();
   #messageId = 500;
 
-  async getChannelMembership() {
+  async getChannelSnapshot(chatId: number) {
+    const metadata = this.metadata.get(chatId) ?? {
+      username: chatId === -4001 ? 'gift_channel' : `channel_${Math.abs(chatId)}`,
+      title: chatId === -4001 ? 'Gift Channel' : `Channel ${Math.abs(chatId)}`,
+    };
     return {
-      status: 'administrator',
-      canPostMessages: true,
-      canEditMessages: true,
-      canDeleteMessages: true,
+      ...metadata,
+      membership: {
+        status: 'administrator',
+        canPostMessages: true,
+        canEditMessages: true,
+        canDeleteMessages: true,
+      },
     };
   }
 
@@ -103,7 +111,7 @@ class FakePublicationGateway implements TelegramGateway {
   }
 }
 
-async function openTestBot() {
+async function openTestBot(allowedTelegramIds: number[] = [700]) {
   const directory = mkdtempSync(join(tmpdir(), 'gift-bot-adapter-'));
   const opened = openDatabase(join(directory, 'gift-bot.sqlite'));
   await migrateDatabase(opened.database);
@@ -138,8 +146,9 @@ async function openTestBot() {
     botInfo: BOT_INFO,
     client: { fetch: fakeApi.fetch },
   });
+  const teamTelegramIds = new Set(allowedTelegramIds);
   registerGiftBotHandlers(bot, {
-    teamTelegramIds: new Set([700]),
+    teamTelegramIds,
     botUsername: BOT_INFO.username,
     wizard,
     channels,
@@ -160,6 +169,7 @@ async function openTestBot() {
     repository,
     channels,
     callbacks,
+    teamTelegramIds,
   };
 }
 
@@ -275,6 +285,39 @@ function callbackData(call: ApiCall, buttonText: string): string {
   return button.callback_data;
 }
 
+async function seedChannelsWizard(
+  database: DatabaseBoundary,
+  input: { id: string; title: string; administratorTelegramId: number },
+) {
+  await database.execute(
+    `insert into giveaways (
+       id, title, state, winner_count, deadline_utc, referrals_enabled,
+       content_kind, content_text, created_by_telegram_id, created_at, updated_at
+     ) values (?, ?, 'draft', 1, ?, 0, 'text', 'Conditions', ?, ?, ?)`,
+    [
+      input.id,
+      input.title,
+      NOW + 86_400_000,
+      input.administratorTelegramId,
+      NOW,
+      NOW,
+    ],
+  );
+  await database.execute(
+    `insert into wizard_sessions (
+       id, administrator_telegram_id, giveaway_id, step, status,
+       draft_data, created_at, updated_at
+     ) values (?, ?, ?, 'channels', 'active', '{}', ?, ?)`,
+    [
+      `wizard-${input.id}`,
+      input.administratorTelegramId,
+      input.id,
+      NOW,
+      NOW,
+    ],
+  );
+}
+
 describe('grammY Gift Bot adapter authorization', () => {
   it('checks the allowlist before every admin command and admin callback', async () => {
     const { bot, database, fakeApi, callbacks } = await openTestBot();
@@ -306,14 +349,11 @@ describe('grammY Gift Bot adapter authorization', () => {
 describe('grammY Gift Bot adapter channel and join routes', () => {
   it('keeps ci_ external owners isolated, binds my_chat_member to from.id, and confirms once', async () => {
     const { bot, database, fakeApi, channels } = await openTestBot();
-    await database.execute(
-      `insert into giveaways (
-         id, title, state, winner_count, deadline_utc, referrals_enabled,
-         content_kind, content_text, created_by_telegram_id, created_at, updated_at
-       ) values ('external-giveaway', 'External gift', 'draft', 1, ?, 0,
-                 'text', 'Conditions', 700, ?, ?)`,
-      [NOW + 86_400_000, NOW, NOW],
-    );
+    await seedChannelsWizard(database, {
+      id: 'external-giveaway',
+      title: 'External gift',
+      administratorTelegramId: 700,
+    });
     const invite = await channels.createExternalInvite('external-giveaway');
 
     await bot.handleUpdate(
@@ -325,6 +365,9 @@ describe('grammY Gift Bot adapter channel and join routes', () => {
       chat_id: 800,
       text: expect.stringContaining('External gift'),
     });
+    expect(fakeApi.sentMessages()[0]!.payload.text).toContain(
+      new Date(invite.expiresAt).toISOString(),
+    );
     const startChannelKeyboard = fakeApi.sentMessages()[0]!.payload.reply_markup as {
       inline_keyboard: Array<Array<{ url: string }>>;
     };
@@ -352,6 +395,68 @@ describe('grammY Gift Bot adapter channel and join routes', () => {
     expect(
       await database.all('select state from channel_invites where id = ?', [invite.id]),
     ).toEqual([{ state: 'consumed' }]);
+  });
+
+  it('stores only an invite id in switch callbacks and confirms the pending switch by actor and invite state', async () => {
+    const { bot, database, fakeApi, channels } = await openTestBot();
+    await seedChannelsWizard(database, {
+      id: 'switch-one',
+      title: 'Switch one',
+      administratorTelegramId: 700,
+    });
+    await seedChannelsWizard(database, {
+      id: 'switch-two',
+      title: 'Switch two',
+      administratorTelegramId: 701,
+    });
+    const first = await channels.createExternalInvite('switch-one');
+    const second = await channels.createExternalInvite('switch-two');
+
+    await bot.handleUpdate(privateMessageUpdate(16, 810, `/start ci_${first.token}`));
+    await bot.handleUpdate(privateMessageUpdate(17, 810, `/start ci_${second.token}`));
+    const switchMessage = fakeApi.sentMessages().at(-1)!;
+    const switchData = callbackData(switchMessage, 'Переключиться');
+    const payloadRows = await database.all<{ payload: string }>(
+      'select payload from callback_actions',
+    );
+    const persistedPayloads = payloadRows.map((row) => row.payload).join('\n');
+    expect(persistedPayloads).toContain(second.id);
+    expect(persistedPayloads).not.toContain(first.token);
+    expect(persistedPayloads).not.toContain(second.token);
+
+    await bot.handleUpdate(callbackUpdate(18, 810, switchData));
+    expect(
+      await database.all(
+        "select giveaway_id from pending_channel_connections where telegram_user_id = 810 and status = 'active'",
+      ),
+    ).toEqual([{ giveaway_id: 'switch-two' }]);
+  });
+
+  it('issues own-channel confirmation as admin-only and rejects a formerly allowlisted operator', async () => {
+    const { bot, database, fakeApi, channels, teamTelegramIds } =
+      await openTestBot();
+    await seedChannelsWizard(database, {
+      id: 'own-allowlist',
+      title: 'Own allowlist',
+      administratorTelegramId: 700,
+    });
+    await channels.createOwnConnection({
+      giveawayId: 'own-allowlist',
+      telegramUserId: 700,
+    });
+
+    await bot.handleUpdate(myChatMemberUpdate(19, 700, -3010));
+    const confirmation = fakeApi.sentMessages().at(-1)!;
+    const confirmData = callbackData(confirmation, 'Подтвердить канал');
+    expect(confirmData).toMatch(/^admin:/);
+
+    teamTelegramIds.delete(700);
+    await bot.handleUpdate(callbackUpdate(20, 700, confirmData));
+    expect(
+      await database.all(
+        "select id from giveaway_channels where giveaway_id = 'own-allowlist'",
+      ),
+    ).toEqual([]);
   });
 
   it('returns an explicit Epic 2 boundary for an active join_ link and creates no participant', async () => {
@@ -447,9 +552,16 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       caption: expect.stringContaining('Екатеринбург, UTC+5'),
     });
     expect(preview.payload.caption).not.toContain('Каналы:');
-    const publishData = callbackData(preview, 'Опубликовать');
+    const previewSummary = fakeApi.sentMessages().at(-1)!;
+    const publishData = callbackData(previewSummary, 'Опубликовать');
     await bot.handleUpdate(callbackUpdate(updateId++, 700, publishData));
     await bot.handleUpdate(callbackUpdate(updateId++, 700, publishData));
+
+    expect(
+      fakeApi.calls
+        .filter((call) => call.method === 'answerCallbackQuery')
+        .at(-1)!.payload.text,
+    ).toContain('active');
 
     expect(telegramGateway.operations.filter((item) => item.startsWith('send:'))).toEqual([
       'send:-4001',
@@ -457,6 +569,68 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(await database.all('select state from giveaways')).toEqual([
       { state: 'active' },
     ]);
+  });
+
+  it('sends exact-limit text and photo previews separately from the short controls summary', async () => {
+    for (const content of [
+      { kind: 'text' as const, value: 'x'.repeat(4005), limit: 4096 },
+      { kind: 'photo' as const, value: 'x'.repeat(933), limit: 1024 },
+    ]) {
+      const { bot, database, fakeApi } = await openTestBot();
+      const giveawayId = `limit-${content.kind}`;
+      await database.execute(
+        `insert into giveaways (
+           id, title, state, winner_count, deadline_utc, referrals_enabled,
+           content_kind, content_text, content_file_id, created_by_telegram_id,
+           created_at, updated_at
+         ) values (?, 'Limit', 'draft', 1, ?, 0, ?, ?, ?, 700, ?, ?)`,
+        [
+          giveawayId,
+          Date.UTC(2026, 7, 10, 7, 30),
+          content.kind,
+          content.value,
+          content.kind === 'photo' ? 'limit-photo-file' : null,
+          NOW,
+          NOW,
+        ],
+      );
+      await database.execute(
+        `insert into giveaway_channels (
+           id, giveaway_id, telegram_chat_id, username, title,
+           owner_telegram_id, status, created_at, updated_at
+         ) values (?, ?, ?, 'limit_channel', 'Limit Channel', 700,
+                   'confirmed', ?, ?)`,
+        [`channel-${giveawayId}`, giveawayId, content.kind === 'text' ? -4010 : -4011, NOW, NOW],
+      );
+      await database.execute(
+        `insert into wizard_sessions (
+           id, administrator_telegram_id, giveaway_id, step, status,
+           draft_data, created_at, updated_at
+         ) values (?, 700, ?, 'preview', 'active', '{}', ?, ?)`,
+        [`wizard-${giveawayId}`, giveawayId, NOW, NOW],
+      );
+
+      await bot.handleUpdate(privateMessageUpdate(80, 700, '/new'));
+      const contentCall = fakeApi.calls.find((call) =>
+        content.kind === 'photo'
+          ? call.method === 'sendPhoto'
+          : call.method === 'sendMessage',
+      )!;
+      const finalText = String(
+        content.kind === 'photo'
+          ? contentCall.payload.caption
+          : contentCall.payload.text,
+      );
+      expect(finalText).toHaveLength(content.limit);
+      expect(contentCall.payload.reply_markup).toBeUndefined();
+
+      const summary = fakeApi.sentMessages().at(-1)!;
+      expect(summary.payload.text).toBe(
+        'Каналы:\n@limit_channel — подтверждён\n\nПосле запуска условия нельзя изменить.',
+      );
+      expect(String(summary.payload.text).length).toBeLessThan(1024);
+      expect(callbackData(summary, 'Опубликовать')).toMatch(/^admin:/);
+    }
   });
 
   it('shows the administrator a failed publication diagnostic and keeps it in /giveaways', async () => {
@@ -480,6 +654,10 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     telegramGateway.sendResults = [
       new TelegramDeliveryError('connection reset after request', 'unknown'),
     ];
+    telegramGateway.metadata.set(-6101, {
+      username: 'diagnostic_channel',
+      title: 'Diagnostic channel',
+    });
     const action = await callbacks.issue({
       actorTelegramId: 700,
       giveawayId: 'diagnostic-giveaway',
@@ -603,6 +781,14 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       551,
       new TelegramDeliveryError('connection reset after request', 'unknown'),
     ];
+    telegramGateway.metadata.set(-6301, {
+      username: 'callback_delivered',
+      title: 'Callback delivered',
+    });
+    telegramGateway.metadata.set(-6302, {
+      username: 'callback_unknown',
+      title: 'Callback unknown',
+    });
     const action = await callbacks.issue({
       actorTelegramId: 700,
       giveawayId: 'callback-failure',
@@ -671,5 +857,66 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       { state: 'cancelled' },
     ]);
     expect(telegramGateway.operations).toEqual(['edit:-5001:601']);
+  });
+
+  it('offers actor-bound cancellation for each exact draft, active, and failed giveaway and makes /cancel select', async () => {
+    const { bot, database, fakeApi } = await openTestBot([700, 701]);
+    for (const [id, title, state, updatedAt] of [
+      ['draft-choice', 'Draft choice', 'draft', NOW + 1],
+      ['active-choice', 'Active choice', 'active', NOW + 2],
+      ['failed-choice', 'Failed choice', 'failed', NOW + 3],
+    ] as const) {
+      await database.execute(
+        `insert into giveaways (
+           id, title, state, winner_count, deadline_utc, referrals_enabled,
+           content_kind, content_text, created_by_telegram_id, created_at, updated_at
+         ) values (?, ?, ?, 1, ?, 0, 'text', 'Conditions', 700, ?, ?)`,
+        [id, title, state, NOW + 86_400_000, NOW, updatedAt],
+      );
+    }
+
+    await bot.handleUpdate(privateMessageUpdate(90, 700, '/giveaways'));
+    const cards = fakeApi.sentMessages().slice(-3);
+    expect(cards.map((card) => card.payload.text)).toEqual([
+      'Failed choice — failed',
+      'Active choice — active',
+      'Draft choice — draft',
+    ]);
+    const failedCardAction = callbackData(cards[0]!, 'Отменить');
+    const actionPayloads = await database.all<{ payload: string }>(
+      "select payload from callback_actions where action = 'request_cancel_giveaway' order by payload",
+    );
+    expect(actionPayloads.map((row) => JSON.parse(row.payload))).toEqual([
+      { giveawayId: 'active-choice' },
+      { giveawayId: 'draft-choice' },
+      { giveawayId: 'failed-choice' },
+    ]);
+
+    await bot.handleUpdate(privateMessageUpdate(91, 700, '/cancel'));
+    const selection = fakeApi.sentMessages().at(-1)!;
+    expect(selection.payload.text).toBe('Выберите розыгрыш для отмены.');
+    const failedSelection = callbackData(selection, 'Failed choice');
+    expect(await database.all('select id, state from giveaways order by id')).toEqual([
+      { id: 'active-choice', state: 'active' },
+      { id: 'draft-choice', state: 'draft' },
+      { id: 'failed-choice', state: 'failed' },
+    ]);
+
+    await bot.handleUpdate(callbackUpdate(92, 701, failedCardAction));
+    expect(await database.all("select state from giveaways where id = 'failed-choice'")).toEqual([
+      { state: 'failed' },
+    ]);
+
+    await bot.handleUpdate(callbackUpdate(93, 700, failedSelection));
+    const confirmation = fakeApi.sentMessages().at(-1)!;
+    expect(confirmation.payload.text).toBe('Отменить розыгрыш «Failed choice»?');
+    const confirm = callbackData(confirmation, 'Подтвердить отмену');
+    await bot.handleUpdate(callbackUpdate(94, 700, confirm));
+
+    expect(await database.all('select id, state from giveaways order by id')).toEqual([
+      { id: 'active-choice', state: 'active' },
+      { id: 'draft-choice', state: 'draft' },
+      { id: 'failed-choice', state: 'cancelled' },
+    ]);
   });
 });

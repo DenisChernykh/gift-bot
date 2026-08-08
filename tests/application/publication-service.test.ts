@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { GiveawayPublicationService } from '../../src/application/giveaway-publication-service.js';
+import { DraftWizardService } from '../../src/application/draft-wizard-service.js';
 import {
   TelegramDeliveryError,
   type TelegramGateway,
@@ -35,11 +36,22 @@ class FakeTelegramGateway implements TelegramGateway {
   sendResults: Array<number | Error> = [];
   deleteResults: Array<void | Error> = [];
   membership = FULL_RIGHTS;
+  readonly metadata = new Map<
+    number,
+    { username: string | null; title: string }
+  >();
   beforeSend?: (input: TelegramGiveawayMessage) => Promise<void>;
 
-  async getChannelMembership(chatId: number) {
-    this.operations.push(`rights:${chatId}`);
-    return this.membership;
+  async getChannelSnapshot(chatId: number) {
+    this.operations.push(`snapshot:${chatId}`);
+    const stored = this.metadata.get(chatId);
+    return {
+      username: stored
+        ? stored.username
+        : `channel_${Math.abs(chatId) - 1000}`,
+      title: stored ? stored.title : `Channel ${Math.abs(chatId) - 1000}`,
+      membership: this.membership,
+    };
   }
 
   async sendGiveawayMessage(input: TelegramGiveawayMessage) {
@@ -87,6 +99,19 @@ async function openPublicationApplication(channelCount = 2) {
   return { ...opened, gateway, repository, service };
 }
 
+async function seedActiveWizard(
+  database: DatabaseBoundary,
+  administratorTelegramId = 700,
+) {
+  await database.execute(
+    `insert into wizard_sessions (
+       id, administrator_telegram_id, giveaway_id, step, status,
+       draft_data, created_at, updated_at
+     ) values ('wizard-active', ?, 'giveaway-1', 'preview', 'active', '{}', ?, ?)`,
+    [administratorTelegramId, NOW, NOW],
+  );
+}
+
 async function seedGiveaway(database: DatabaseBoundary, channelCount: number) {
   await database.execute(
     `insert into giveaways (
@@ -115,6 +140,76 @@ async function seedGiveaway(database: DatabaseBoundary, channelCount: number) {
 }
 
 describe('GiveawayPublicationService', () => {
+  it('retires the active wizard atomically on activation so /new creates a fresh wizard', async () => {
+    const { database, gateway, repository, service } =
+      await openPublicationApplication(1);
+    await seedActiveWizard(database);
+    gateway.sendResults = [500];
+
+    expect(await service.publish('giveaway-1')).toMatchObject({ kind: 'active' });
+    expect(
+      await database.all(
+        "select status from wizard_sessions where id = 'wizard-active'",
+      ),
+    ).toEqual([{ status: 'completed' }]);
+
+    const wizard = new DraftWizardService(repository, {
+      createId: (kind) => `${kind}-fresh`,
+      now: () => NOW + 1,
+    });
+    expect(await wizard.startOrResume(700)).toMatchObject({
+      kind: 'created',
+      wizard: { id: 'wizard-fresh', step: 'title' },
+    });
+  });
+
+  it('retires the wizard on an unknown terminal publication failure while retaining the failed giveaway', async () => {
+    const { database, gateway, repository, service } =
+      await openPublicationApplication(1);
+    await seedActiveWizard(database);
+    gateway.sendResults = [
+      new TelegramDeliveryError('connection reset after request', 'unknown'),
+    ];
+
+    expect(await service.publish('giveaway-1')).toMatchObject({ kind: 'failed' });
+    expect(
+      await database.all(
+        "select status from wizard_sessions where id = 'wizard-active'",
+      ),
+    ).toEqual([{ status: 'failed' }]);
+    expect(await database.all('select id, state from giveaways')).toEqual([
+      { id: 'giveaway-1', state: 'failed' },
+    ]);
+
+    const wizard = new DraftWizardService(repository, {
+      createId: (kind) => `${kind}-after-failure`,
+      now: () => NOW + 1,
+    });
+    expect(await wizard.startOrResume(700)).toMatchObject({
+      kind: 'created',
+      wizard: { id: 'wizard-after-failure', step: 'title' },
+    });
+  });
+
+  it('retires the wizard when rollback failure makes publication terminal', async () => {
+    const { database, gateway, service } = await openPublicationApplication(2);
+    await seedActiveWizard(database);
+    gateway.sendResults = [
+      510,
+      new TelegramDeliveryError('forbidden', 'definite'),
+    ];
+    gateway.deleteResults = [
+      new TelegramDeliveryError('cannot delete', 'definite'),
+    ];
+
+    expect(await service.publish('giveaway-1')).toMatchObject({ kind: 'failed' });
+    expect(
+      await database.all(
+        "select status from wizard_sessions where id = 'wizard-active'",
+      ),
+    ).toEqual([{ status: 'failed' }]);
+  });
+
   it('preflights every channel, saves all delivery intents before sending, and activates only after both messages are saved', async () => {
     const { database, gateway, service } = await openPublicationApplication(2);
     gateway.sendResults = [501, 502];
@@ -137,7 +232,10 @@ describe('GiveawayPublicationService', () => {
     const result = await service.publish('giveaway-1');
 
     expect(result).toMatchObject({ kind: 'active', giveawayId: 'giveaway-1' });
-    expect(gateway.operations.slice(0, 2)).toEqual(['rights:-1001', 'rights:-1002']);
+    expect(gateway.operations.slice(0, 2)).toEqual([
+      'snapshot:-1001',
+      'snapshot:-1002',
+    ]);
     expect(gateway.sent).toEqual([
       expect.objectContaining({
         chatId: -1001,
@@ -179,6 +277,61 @@ describe('GiveawayPublicationService', () => {
       { state: 'draft' },
     ]);
     expect(await database.all('select id from publication_runs')).toEqual([]);
+  });
+
+  it('refreshes current public channel usernames and titles before any send', async () => {
+    const { database, gateway, service } = await openPublicationApplication(2);
+    gateway.metadata.set(-1001, {
+      username: '@Renamed_Channel',
+      title: 'Renamed Channel',
+    });
+    gateway.metadata.set(-1002, {
+      username: 'channel_2',
+      title: 'Channel 2',
+    });
+
+    expect(await service.publish('giveaway-1')).toMatchObject({ kind: 'active' });
+    expect(
+      await database.all(
+        'select username, title from giveaway_channels order by id',
+      ),
+    ).toEqual([
+      { username: 'renamed_channel', title: 'Renamed Channel' },
+      { username: 'channel_2', title: 'Channel 2' },
+    ]);
+    expect(gateway.operations.indexOf('snapshot:-1002')).toBeLessThan(
+      gateway.operations.indexOf('send:-1001'),
+    );
+  });
+
+  it('blocks publication without artifacts or sends when a channel loses its public username', async () => {
+    const { database, gateway, service } = await openPublicationApplication(2);
+    gateway.metadata.set(-1001, {
+      username: '@renamed_channel',
+      title: 'Renamed Channel',
+    });
+    gateway.metadata.set(-1002, { username: null, title: 'Private Channel' });
+
+    await expect(service.publish('giveaway-1')).rejects.toMatchObject({
+      diagnostic: {
+        stage: 'preflight',
+        errorKind: 'missing_public_username',
+        channel: { id: 'channel-2' },
+      },
+    });
+
+    expect(gateway.sent).toEqual([]);
+    expect(await database.all('select id from publication_runs')).toEqual([]);
+    expect(await database.all('select token_hash from join_tokens')).toEqual([]);
+    expect(await database.all('select id from publication_deliveries')).toEqual([]);
+    expect(
+      await database.all(
+        'select username, title from giveaway_channels order by id',
+      ),
+    ).toEqual([
+      { username: 'channel_1', title: 'Channel 1' },
+      { username: 'channel_2', title: 'Channel 2' },
+    ]);
   });
 
   it('rejects a stored final render overflow without persisting publication state', async () => {

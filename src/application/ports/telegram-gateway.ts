@@ -21,6 +21,12 @@ export type TelegramCancelledMessage = {
 
 export type TelegramDeliveryOutcome = 'definite' | 'unknown';
 
+export type TelegramChannelSnapshot = {
+  username: string | null;
+  title: string;
+  membership: TelegramChannelMembership;
+};
+
 export class TelegramDeliveryError extends Error {
   readonly outcome: TelegramDeliveryOutcome;
   readonly retryAfterMs: number | null;
@@ -39,7 +45,7 @@ export class TelegramDeliveryError extends Error {
 }
 
 export interface TelegramGateway {
-  getChannelMembership(chatId: number): Promise<TelegramChannelMembership>;
+  getChannelSnapshot(chatId: number): Promise<TelegramChannelSnapshot>;
   sendGiveawayMessage(
     input: TelegramGiveawayMessage,
   ): Promise<{ messageId: number }>;

@@ -98,6 +98,57 @@ describe('GrammyTelegramGateway cancellation edits', () => {
   });
 });
 
+describe('GrammyTelegramGateway channel preflight', () => {
+  it('reads current channel metadata and bot administrator rights together', async () => {
+    const calls: string[] = [];
+    const api = {
+      getChat: async (chatId: number) => {
+        calls.push(`chat:${chatId}`);
+        return {
+          id: chatId,
+          type: 'channel',
+          title: 'Current title',
+          username: 'Current_Public',
+        };
+      },
+      getChatMember: async (chatId: number, userId: number) => {
+        calls.push(`member:${chatId}:${userId}`);
+        return {
+          status: 'administrator',
+          user: { id: userId, is_bot: true, first_name: 'Gift Bot' },
+          can_be_edited: false,
+          is_anonymous: false,
+          can_manage_chat: true,
+          can_delete_messages: true,
+          can_manage_video_chats: false,
+          can_restrict_members: false,
+          can_promote_members: false,
+          can_change_info: false,
+          can_invite_users: false,
+          can_post_stories: false,
+          can_edit_stories: false,
+          can_delete_stories: false,
+          can_post_messages: true,
+          can_edit_messages: true,
+        };
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    expect(await gateway.getChannelSnapshot(-1001)).toEqual({
+      username: 'Current_Public',
+      title: 'Current title',
+      membership: {
+        status: 'administrator',
+        canPostMessages: true,
+        canEditMessages: true,
+        canDeleteMessages: true,
+      },
+    });
+    expect(calls).toEqual(['chat:-1001', 'member:-1001:999']);
+  });
+});
+
 function telegramEditError(description: string) {
   return new GrammyError(
     'edit failed',

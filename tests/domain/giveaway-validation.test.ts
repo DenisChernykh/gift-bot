@@ -36,9 +36,16 @@ describe('giveaway field validation', () => {
   });
 
   it('allows text or one photo caption within Telegram limits', () => {
-    expect(validateGiveawayContent({ kind: 'text', text: '  Hello  ' })).toEqual({
+    expect(
+      validateGiveawayContent({
+        kind: 'text',
+        text: '  Hello  ',
+        entities: [{ type: 'bold', offset: 2, length: 5 }],
+      }),
+    ).toEqual({
       kind: 'text',
-      text: 'Hello',
+      text: '  Hello  ',
+      entities: [{ type: 'bold', offset: 2, length: 5 }],
     });
     expect(
       validateGiveawayContent({ kind: 'photo', caption: 'Photo conditions' }),

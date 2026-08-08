@@ -27,13 +27,21 @@ async function openTestService() {
   const directory = mkdtempSync(join(tmpdir(), 'gift-bot-channel-'));
   const opened = openDatabase(join(directory, 'gift-bot.sqlite'));
   await migrateDatabase(opened.database);
-  for (const id of ['giveaway-1', 'giveaway-2']) {
+  for (const [index, id] of ['giveaway-1', 'giveaway-2'].entries()) {
+    const administratorTelegramId = 700 + index;
     await opened.database.execute(
       `insert into giveaways (
          id, title, state, winner_count, deadline_utc, referrals_enabled,
          content_kind, content_text, created_by_telegram_id, created_at, updated_at
-       ) values (?, ?, 'draft', 1, ?, 0, 'text', 'Content', 700, ?, ?)`,
-      [id, id, NOW + 86_400_000, NOW, NOW],
+       ) values (?, ?, 'draft', 1, ?, 0, 'text', 'Content', ?, ?, ?)`,
+      [id, id, NOW + 86_400_000, administratorTelegramId, NOW, NOW],
+    );
+    await opened.database.execute(
+      `insert into wizard_sessions (
+         id, administrator_telegram_id, giveaway_id, step, status,
+         draft_data, created_at, updated_at
+       ) values (?, ?, ?, 'channels', 'active', '{}', ?, ?)`,
+      [`wizard-${index + 1}`, administratorTelegramId, id, NOW, NOW],
     );
   }
 
@@ -105,10 +113,9 @@ describe('ChannelAuthorizationService pending context', () => {
       ),
     ).toEqual([{ giveaway_id: 'giveaway-1' }]);
 
-    const switched = await service.openExternalInvite({
-      token: second.token,
+    const switched = await service.switchExternalInvite({
+      inviteId: second.id,
       telegramUserId: 801,
-      confirmSwitch: true,
     });
     expect(switched).toMatchObject({
       kind: 'ready',
@@ -122,6 +129,28 @@ describe('ChannelAuthorizationService pending context', () => {
       { giveaway_id: 'giveaway-1', status: 'superseded' },
       { giveaway_id: 'giveaway-2', status: 'active' },
     ]);
+  });
+
+  it('switches an invitation only by its non-bearer id for the bound actor while it is active', async () => {
+    const { database, service, setNow } = await openTestService();
+    const first = await service.createExternalInvite('giveaway-1');
+    const second = await service.createExternalInvite('giveaway-2');
+    await service.openExternalInvite({ token: first.token, telegramUserId: 811 });
+    await service.openExternalInvite({ token: second.token, telegramUserId: 811 });
+
+    await expect(
+      service.switchExternalInvite({ inviteId: second.id, telegramUserId: 812 }),
+    ).rejects.toThrow('Channel invitation belongs to another user');
+
+    setNow(second.expiresAt);
+    await expect(
+      service.switchExternalInvite({ inviteId: second.id, telegramUserId: 811 }),
+    ).rejects.toThrow('Channel invitation has expired');
+    expect(
+      await database.all(
+        "select giveaway_id from pending_channel_connections where telegram_user_id = 811 and status = 'active'",
+      ),
+    ).toEqual([{ giveaway_id: 'giveaway-1' }]);
   });
 });
 
@@ -192,6 +221,74 @@ describe('ChannelAuthorizationService invitation lifecycle', () => {
 });
 
 describe('ChannelAuthorizationService channel confirmation', () => {
+  it('rejects channel authorization mutations outside a draft channels wizard without writing rows', async () => {
+    const { database, service } = await openTestService();
+    const invite = await service.createExternalInvite('giveaway-1');
+    await service.createOwnConnection({
+      giveawayId: 'giveaway-1',
+      telegramUserId: 700,
+    });
+    await service.observeChannel({
+      telegramUserId: 700,
+      ownConnectionAllowed: true,
+      telegramChatId: -1099,
+      username: 'stale_channel',
+      title: 'Stale Channel',
+      membership: FULL_RIGHTS,
+    });
+    await database.execute(
+      "update wizard_sessions set step = 'preview' where giveaway_id = 'giveaway-1'",
+    );
+
+    await expect(
+      service.createOwnConnection({
+        giveawayId: 'giveaway-1',
+        telegramUserId: 700,
+      }),
+    ).rejects.toThrow('Giveaway channels can only change during the channels step');
+    await expect(service.createExternalInvite('giveaway-1')).rejects.toThrow(
+      'Giveaway channels can only change during the channels step',
+    );
+    await expect(
+      service.openExternalInvite({ token: invite.token, telegramUserId: 899 }),
+    ).rejects.toThrow('Giveaway channels can only change during the channels step');
+    await expect(
+      service.confirmChannel({
+        telegramUserId: 700,
+        telegramChatId: -1099,
+        mode: 'own',
+      }),
+    ).rejects.toThrow('Giveaway channels can only change during the channels step');
+
+    expect(
+      await database.all(
+        "select count(*) as count from giveaway_channels where telegram_chat_id = -1099",
+      ),
+    ).toEqual([{ count: 0 }]);
+    expect(
+      await database.all(
+        "select count(*) as count from pending_channel_connections where telegram_user_id = 899",
+      ),
+    ).toEqual([{ count: 0 }]);
+  });
+
+  it('rejects stale invitations after launch without creating a pending connection', async () => {
+    const { database, service } = await openTestService();
+    const invite = await service.createExternalInvite('giveaway-2');
+    await database.execute(
+      "update giveaways set state = 'active' where id = 'giveaway-2'",
+    );
+
+    await expect(
+      service.openExternalInvite({ token: invite.token, telegramUserId: 813 }),
+    ).rejects.toThrow('Giveaway channels can only change during the channels step');
+    expect(
+      await database.all(
+        'select count(*) as count from pending_channel_connections where telegram_user_id = 813',
+      ),
+    ).toEqual([{ count: 0 }]);
+  });
+
   it('requires a public username, full bot rights, and the pending actor', async () => {
     const { service } = await openTestService();
     await service.createOwnConnection({
@@ -202,6 +299,7 @@ describe('ChannelAuthorizationService channel confirmation', () => {
     await expect(
       service.observeChannel({
         telegramUserId: 700,
+        ownConnectionAllowed: true,
         telegramChatId: -1001,
         username: null,
         title: 'Private channel',
@@ -211,6 +309,7 @@ describe('ChannelAuthorizationService channel confirmation', () => {
     await expect(
       service.observeChannel({
         telegramUserId: 700,
+        ownConnectionAllowed: true,
         telegramChatId: -1001,
         username: 'public_channel',
         title: 'Public channel',
@@ -220,6 +319,7 @@ describe('ChannelAuthorizationService channel confirmation', () => {
     await expect(
       service.observeChannel({
         telegramUserId: 999,
+        ownConnectionAllowed: false,
         telegramChatId: -1001,
         username: 'public_channel',
         title: 'Public channel',
@@ -235,6 +335,7 @@ describe('ChannelAuthorizationService channel confirmation', () => {
 
     const candidate = await service.observeChannel({
       telegramUserId: 804,
+      ownConnectionAllowed: false,
       telegramChatId: -1002,
       username: '@Gift_Public',
       title: 'Gift Public',
@@ -252,6 +353,7 @@ describe('ChannelAuthorizationService channel confirmation', () => {
     const connected = await service.confirmChannel({
       telegramUserId: 804,
       telegramChatId: -1002,
+      mode: 'external',
     });
     expect(connected).toMatchObject({
       kind: 'connected',
@@ -262,7 +364,13 @@ describe('ChannelAuthorizationService channel confirmation', () => {
         status: 'confirmed',
       },
     });
-    expect(await service.confirmChannel({ telegramUserId: 804, telegramChatId: -1002 })).toMatchObject({
+    expect(
+      await service.confirmChannel({
+        telegramUserId: 804,
+        telegramChatId: -1002,
+        mode: 'external',
+      }),
+    ).toMatchObject({
       kind: 'already_connected',
       channel: { telegramChatId: -1002 },
     });
@@ -278,23 +386,33 @@ describe('ChannelAuthorizationService channel confirmation', () => {
     await service.createOwnConnection({ giveawayId: 'giveaway-1', telegramUserId: 700 });
     await service.observeChannel({
       telegramUserId: 700,
+      ownConnectionAllowed: true,
       telegramChatId: -1003,
       username: 'one',
       title: 'One',
       membership: FULL_RIGHTS,
     });
-    await service.confirmChannel({ telegramUserId: 700, telegramChatId: -1003 });
+    await service.confirmChannel({
+      telegramUserId: 700,
+      telegramChatId: -1003,
+      mode: 'own',
+    });
 
     await service.createOwnConnection({ giveawayId: 'giveaway-1', telegramUserId: 701 });
     await service.observeChannel({
       telegramUserId: 701,
+      ownConnectionAllowed: true,
       telegramChatId: -1003,
       username: 'one',
       title: 'One',
       membership: FULL_RIGHTS,
     });
     await expect(
-      service.confirmChannel({ telegramUserId: 701, telegramChatId: -1003 }),
+      service.confirmChannel({
+        telegramUserId: 701,
+        telegramChatId: -1003,
+        mode: 'own',
+      }),
     ).rejects.toThrow('Channel is already connected to this giveaway');
   });
 });

@@ -29,7 +29,12 @@ export type PendingChannelConnection = {
 };
 
 export type PendingConnectionResult =
-  | { kind: 'ready'; context: PendingChannelConnection }
+  | {
+      kind: 'ready';
+      context: PendingChannelConnection;
+      mode: 'own' | 'external';
+      inviteExpiresAt: number | null;
+    }
   | {
       kind: 'switch_confirmation_required';
       current: PendingChannelConnection;
@@ -73,6 +78,13 @@ export interface ChannelAuthorizationRepository {
     now: number;
   }): Promise<PendingConnectionResult>;
 
+  switchExternalInvite(input: {
+    id: string;
+    inviteId: string;
+    telegramUserId: number;
+    now: number;
+  }): Promise<PendingConnectionResult>;
+
   revokeExternalInvite(input: {
     inviteId: string;
     now: number;
@@ -80,10 +92,16 @@ export interface ChannelAuthorizationRepository {
 
   storeChannelCandidate(input: {
     telegramUserId: number;
+    ownConnectionAllowed: boolean;
     candidate: ChannelCandidate;
     now: number;
   }): Promise<
-    | { kind: 'candidate_ready'; candidate: ChannelCandidate }
+    | {
+        kind: 'candidate_ready';
+        candidate: ChannelCandidate;
+        giveawayId: string;
+        mode: 'own' | 'external';
+      }
     | { kind: 'already_connected'; channel: ConfirmedGiveawayChannel }
   >;
 
@@ -91,6 +109,7 @@ export interface ChannelAuthorizationRepository {
     id: string;
     telegramUserId: number;
     telegramChatId: number;
+    mode: 'own' | 'external';
     now: number;
   }): Promise<
     | { kind: 'connected'; channel: ConfirmedGiveawayChannel }

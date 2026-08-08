@@ -35,8 +35,8 @@ export class GiveawayManagementService {
     return { kind: 'epic_2_boundary' as const, giveaway: target };
   }
 
-  findCancellationTarget(administratorTelegramId: number) {
-    return this.#repository.findCancellationTarget(administratorTelegramId);
+  listCancellationTargets(administratorTelegramId: number) {
+    return this.#repository.listCancellationTargets(administratorTelegramId);
   }
 
   cancelUnmaterializedWizard(administratorTelegramId: number) {

@@ -27,7 +27,6 @@ import type {
   RecoverablePublication,
 } from '../application/ports/giveaway-lifecycle-repository.js';
 import type {
-  CancellationTarget,
   GiveawayListItem,
   GiveawayManagementRepository,
   JoinLinkTarget,
@@ -336,18 +335,21 @@ export class SqliteGiveawayCreationRepository
     expiresAt: number;
     now: number;
   }): Promise<ChannelInvitation> {
-    await this.#database.execute(
-      `insert into channel_invites (
-         id, giveaway_id, token_hash, invited_telegram_id, state,
-         expires_at, consumed_at, revoked_at, created_at
-       ) values (?, ?, ?, null, 'active', ?, null, null, ?)`,
-      [input.id, input.giveawayId, input.tokenHash, input.expiresAt, input.now],
-    );
-    const invite = await this.#findInviteById(this.#database, input.id);
-    if (!invite) {
-      throw new Error('Failed to persist channel invitation');
-    }
-    return invite;
+    return this.#database.transaction(async (transaction) => {
+      await this.#assertChannelMutationAllowed(transaction, input.giveawayId);
+      await transaction.execute(
+        `insert into channel_invites (
+           id, giveaway_id, token_hash, invited_telegram_id, state,
+           expires_at, consumed_at, revoked_at, created_at
+         ) values (?, ?, ?, null, 'active', ?, null, null, ?)`,
+        [input.id, input.giveawayId, input.tokenHash, input.expiresAt, input.now],
+      );
+      const invite = await this.#findInviteById(transaction, input.id);
+      if (!invite) {
+        throw new Error('Failed to persist channel invitation');
+      }
+      return invite;
+    });
   }
 
   async createOwnConnection(input: {
@@ -358,6 +360,7 @@ export class SqliteGiveawayCreationRepository
     now: number;
   }): Promise<PendingConnectionResult> {
     return this.#database.transaction(async (transaction) => {
+      await this.#assertChannelMutationAllowed(transaction, input.giveawayId);
       const current = await this.#findActiveConnection(
         transaction,
         input.telegramUserId,
@@ -366,7 +369,12 @@ export class SqliteGiveawayCreationRepository
         current?.giveawayId === input.giveawayId &&
         current.inviteId === null
       ) {
-        return { kind: 'ready', context: current };
+        return {
+          kind: 'ready',
+          context: current,
+          mode: 'own',
+          inviteExpiresAt: null,
+        };
       }
       if (current && !input.confirmSwitch) {
         return {
@@ -388,6 +396,8 @@ export class SqliteGiveawayCreationRepository
           telegramUserId: input.telegramUserId,
           now: input.now,
         }),
+        mode: 'own',
+        inviteExpiresAt: null,
       };
     });
   }
@@ -406,6 +416,11 @@ export class SqliteGiveawayCreationRepository
       if (!invite) {
         return { error: new Error('Unknown channel invitation') };
       }
+      const guardError = await this.#channelMutationGuardError(
+        transaction,
+        invite.giveawayId,
+      );
+      if (guardError) return { error: guardError };
       if (invite.state === 'active' && invite.expiresAt <= input.now) {
         await transaction.execute(
           "update channel_invites set state = 'expired' where id = ?",
@@ -442,7 +457,12 @@ export class SqliteGiveawayCreationRepository
         input.telegramUserId,
       );
       if (current?.inviteId === invite.id) {
-        return { kind: 'ready', context: current };
+        return {
+          kind: 'ready',
+          context: current,
+          mode: 'external',
+          inviteExpiresAt: invite.expiresAt,
+        };
       }
       if (current && !input.confirmSwitch) {
         return {
@@ -464,12 +484,81 @@ export class SqliteGiveawayCreationRepository
           telegramUserId: input.telegramUserId,
           now: input.now,
         }),
+        mode: 'external',
+        inviteExpiresAt: invite.expiresAt,
       };
     });
 
     if ('error' in result) {
       throw result.error;
     }
+    return result;
+  }
+
+  async switchExternalInvite(input: {
+    id: string;
+    inviteId: string;
+    telegramUserId: number;
+    now: number;
+  }): Promise<PendingConnectionResult> {
+    const result = await this.#database.transaction<
+      PendingConnectionResult | { error: Error }
+    >(async (transaction) => {
+      const invite = await this.#findInviteById(transaction, input.inviteId);
+      if (!invite) return { error: new Error('Unknown channel invitation') };
+      const guardError = await this.#channelMutationGuardError(
+        transaction,
+        invite.giveawayId,
+      );
+      if (guardError) return { error: guardError };
+      if (invite.state === 'active' && invite.expiresAt <= input.now) {
+        await transaction.execute(
+          "update channel_invites set state = 'expired' where id = ?",
+          [invite.id],
+        );
+        await transaction.execute(
+          "update pending_channel_connections set status = 'superseded', updated_at = ? where invite_id = ? and status = 'active'",
+          [input.now, invite.id],
+        );
+        return { error: new Error('Channel invitation has expired') };
+      }
+      if (invite.state !== 'active') {
+        return { error: new Error(`Channel invitation is ${invite.state}`) };
+      }
+      if (invite.invitedTelegramId !== input.telegramUserId) {
+        return { error: new Error('Channel invitation belongs to another user') };
+      }
+
+      const current = await this.#findActiveConnection(
+        transaction,
+        input.telegramUserId,
+      );
+      if (!current) {
+        return { error: new Error('No active channel connection to switch') };
+      }
+      if (current.inviteId === invite.id) {
+        return {
+          kind: 'ready',
+          context: current,
+          mode: 'external',
+          inviteExpiresAt: invite.expiresAt,
+        };
+      }
+      await this.#supersedeConnection(transaction, current.id, input.now);
+      return {
+        kind: 'ready',
+        context: await this.#insertConnection(transaction, {
+          id: input.id,
+          giveawayId: invite.giveawayId,
+          inviteId: invite.id,
+          telegramUserId: input.telegramUserId,
+          now: input.now,
+        }),
+        mode: 'external',
+        inviteExpiresAt: invite.expiresAt,
+      };
+    });
+    if ('error' in result) throw result.error;
     return result;
   }
 
@@ -485,6 +574,7 @@ export class SqliteGiveawayCreationRepository
       if (invite.state === 'consumed') {
         throw new Error('Consumed channel invitation cannot be revoked');
       }
+      await this.#assertChannelMutationAllowed(transaction, invite.giveawayId);
       await this.#expireInvitesForGiveaway(
         transaction,
         invite.giveawayId,
@@ -515,14 +605,25 @@ export class SqliteGiveawayCreationRepository
 
   async storeChannelCandidate(input: {
     telegramUserId: number;
+    ownConnectionAllowed: boolean;
     candidate: ChannelCandidate;
     now: number;
   }): Promise<
-    | { kind: 'candidate_ready'; candidate: ChannelCandidate }
+    | {
+        kind: 'candidate_ready';
+        candidate: ChannelCandidate;
+        giveawayId: string;
+        mode: 'own' | 'external';
+      }
     | { kind: 'already_connected'; channel: ConfirmedGiveawayChannel }
   > {
     const result = await this.#database.transaction<
-      | { kind: 'candidate_ready'; candidate: ChannelCandidate }
+      | {
+          kind: 'candidate_ready';
+          candidate: ChannelCandidate;
+          giveawayId: string;
+          mode: 'own' | 'external';
+        }
       | { kind: 'already_connected'; channel: ConfirmedGiveawayChannel }
       | { error: Error }
     >(async (transaction) => {
@@ -539,6 +640,15 @@ export class SqliteGiveawayCreationRepository
         return existing
           ? { kind: 'already_connected', channel: existing }
           : { error: new Error('No active channel connection for this user') };
+      }
+
+      const guardError = await this.#channelMutationGuardError(
+        transaction,
+        connection.giveawayId,
+      );
+      if (guardError) return { error: guardError };
+      if (connection.inviteId === null && !input.ownConnectionAllowed) {
+        return { error: new Error('Own channel connection requires allowlist') };
       }
 
       const inviteError = await this.#expireOrValidateConnectionInvite(
@@ -564,7 +674,12 @@ export class SqliteGiveawayCreationRepository
           connection.id,
         ],
       );
-      return { kind: 'candidate_ready', candidate: input.candidate };
+      return {
+        kind: 'candidate_ready',
+        candidate: input.candidate,
+        giveawayId: connection.giveawayId,
+        mode: connection.inviteId === null ? 'own' : 'external',
+      };
     });
 
     if ('error' in result) {
@@ -577,6 +692,7 @@ export class SqliteGiveawayCreationRepository
     id: string;
     telegramUserId: number;
     telegramChatId: number;
+    mode: 'own' | 'external';
     now: number;
   }): Promise<
     | { kind: 'connected'; channel: ConfirmedGiveawayChannel }
@@ -600,6 +716,15 @@ export class SqliteGiveawayCreationRepository
         return existing
           ? { kind: 'already_connected', channel: existing }
           : { error: new Error('No active channel connection for this user') };
+      }
+      const guardError = await this.#channelMutationGuardError(
+        transaction,
+        connection.giveawayId,
+      );
+      if (guardError) return { error: guardError };
+      const actualMode = connection.inviteId === null ? 'own' : 'external';
+      if (actualMode !== input.mode) {
+        return { error: new Error('Channel confirmation mode does not match') };
       }
       if (
         !connection.candidate ||
@@ -739,6 +864,58 @@ export class SqliteGiveawayCreationRepository
     return this.getPublicationGiveaway(giveawayId);
   }
 
+  async refreshPublicationChannels(input: {
+    giveawayId: string;
+    channels: PublicationGiveaway['channels'];
+    now: number;
+  }): Promise<void> {
+    await this.#database.transaction(async (transaction) => {
+      const giveawayRows = await transaction.all<{ state: string }>(
+        'select state from giveaways where id = ?',
+        [input.giveawayId],
+      );
+      const state = giveawayRows[0]?.state;
+      if (!state) throw new Error('Unknown giveaway');
+      if (state !== 'draft') {
+        throw new Error(`Giveaway cannot be published from ${state}`);
+      }
+      const stored = await transaction.all<{
+        id: string;
+        telegramChatId: number;
+      }>(
+        `select id, telegram_chat_id as telegramChatId
+           from giveaway_channels
+          where giveaway_id = ? and status = 'confirmed'
+          order by created_at, id`,
+        [input.giveawayId],
+      );
+      if (
+        stored.length !== input.channels.length ||
+        stored.some(
+          (channel, index) =>
+            channel.id !== input.channels[index]?.id ||
+            channel.telegramChatId !== input.channels[index]?.telegramChatId,
+        )
+      ) {
+        throw new Error('Confirmed channels changed during publication preflight');
+      }
+      for (const channel of input.channels) {
+        await transaction.execute(
+          `update giveaway_channels
+              set username = ?, title = ?, updated_at = ?
+            where id = ? and giveaway_id = ? and status = 'confirmed'`,
+          [
+            channel.username,
+            channel.title,
+            input.now,
+            channel.id,
+            input.giveawayId,
+          ],
+        );
+      }
+    });
+  }
+
   async listGiveaways(
     administratorTelegramId: number,
   ): Promise<GiveawayListItem[]> {
@@ -803,32 +980,50 @@ export class SqliteGiveawayCreationRepository
     return rows[0] ?? null;
   }
 
-  async findCancellationTarget(
+  async listCancellationTargets(
     administratorTelegramId: number,
-  ): Promise<CancellationTarget> {
+  ): Promise<Array<
+    | { kind: 'wizard' }
+    | {
+        kind: 'giveaway';
+        giveawayId: string;
+        title: string;
+        state: 'draft' | 'active' | 'failed';
+      }
+  >> {
+    const targets: Array<
+      | { kind: 'wizard' }
+      | {
+          kind: 'giveaway';
+          giveawayId: string;
+          title: string;
+          state: 'draft' | 'active' | 'failed';
+        }
+    > = [];
     const wizard = await this.#findActiveWizard(
       this.#database,
       administratorTelegramId,
     );
-    if (wizard && !wizard.giveawayId) return { kind: 'wizard' };
-    if (wizard?.giveawayId) {
-      const summary = await this.getPublicationGiveaway(wizard.giveawayId);
-      return {
-        kind: 'giveaway',
-        giveawayId: wizard.giveawayId,
-        title: summary.title,
-      };
-    }
-    const rows = await this.#database.all<{ id: string; title: string }>(
-      `select id, title from giveaways
-        where created_by_telegram_id = ? and state in ('draft', 'active')
-        order by updated_at desc, id limit 1`,
+    if (wizard && !wizard.giveawayId) targets.push({ kind: 'wizard' });
+    const giveaways = await this.#database.all<{
+      id: string;
+      title: string;
+      state: 'draft' | 'active' | 'failed';
+    }>(
+      `select id, title, state from giveaways
+        where created_by_telegram_id = ? and state in ('draft', 'active', 'failed')
+        order by updated_at desc, id`,
       [administratorTelegramId],
     );
-    const giveaway = rows[0];
-    return giveaway
-      ? { kind: 'giveaway', giveawayId: giveaway.id, title: giveaway.title }
-      : { kind: 'none' };
+    targets.push(
+      ...giveaways.map((giveaway) => ({
+        kind: 'giveaway' as const,
+        giveawayId: giveaway.id,
+        title: giveaway.title,
+        state: giveaway.state,
+      })),
+    );
+    return targets;
   }
 
   async cancelUnmaterializedWizard(input: {
@@ -999,6 +1194,10 @@ export class SqliteGiveawayCreationRepository
         "update join_tokens set state = 'active' where giveaway_id = ? and state = 'pending'",
         [run.giveawayId],
       );
+      await transaction.execute(
+        "update wizard_sessions set status = 'completed', updated_at = ? where giveaway_id = ? and status = 'active'",
+        [now, run.giveawayId],
+      );
     });
   }
 
@@ -1035,6 +1234,12 @@ export class SqliteGiveawayCreationRepository
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'pending'",
         [giveawayId],
       );
+      if (!input.complete) {
+        await transaction.execute(
+          "update wizard_sessions set status = 'failed', updated_at = ? where giveaway_id = ? and status = 'active'",
+          [input.now, giveawayId],
+        );
+      }
     });
   }
 
@@ -1057,6 +1262,10 @@ export class SqliteGiveawayCreationRepository
       await transaction.execute(
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'pending'",
         [giveawayId],
+      );
+      await transaction.execute(
+        "update wizard_sessions set status = 'failed', updated_at = ? where giveaway_id = ? and status = 'active'",
+        [input.now, giveawayId],
       );
     });
   }
@@ -1103,7 +1312,11 @@ export class SqliteGiveawayCreationRepository
       `select count(*) as count
          from publication_deliveries d
          join publication_runs r on r.id = d.publication_run_id
-        where r.giveaway_id = ? and r.status = 'succeeded'
+         join giveaways g on g.id = r.giveaway_id
+        where g.id = ?
+          and ((g.state = 'active' and r.status = 'succeeded')
+            or (g.state = 'failed' and r.status = 'failed'
+              and r.id = g.failure_run_id))
           and d.status = 'delivered' and d.message_id is not null`,
       [giveawayId],
     );
@@ -1124,11 +1337,13 @@ export class SqliteGiveawayCreationRepository
         referralsEnabled: number;
         contentKind: 'text' | 'photo';
         contentText: string;
+        failureRunId: string | null;
       }>(
         `select title, state, winner_count as winnerCount,
                 deadline_utc as deadlineUtc,
                 referrals_enabled as referralsEnabled,
-                content_kind as contentKind, content_text as contentText
+                content_kind as contentKind, content_text as contentText,
+                failure_run_id as failureRunId
            from giveaways where id = ?`,
         [input.giveawayId],
       );
@@ -1143,7 +1358,11 @@ export class SqliteGiveawayCreationRepository
           ),
         };
       }
-      if (giveaway.state !== 'draft' && giveaway.state !== 'active') {
+      if (
+        giveaway.state !== 'draft' &&
+        giveaway.state !== 'active' &&
+        giveaway.state !== 'failed'
+      ) {
         throw new Error(`Giveaway cannot be cancelled from ${giveaway.state}`);
       }
 
@@ -1156,7 +1375,7 @@ export class SqliteGiveawayCreationRepository
         [input.now, input.giveawayId],
       );
       await transaction.execute(
-        "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'active'",
+        "update join_tokens set state = 'revoked' where giveaway_id = ? and state in ('active', 'pending')",
         [input.giveawayId],
       );
 
@@ -1176,10 +1395,19 @@ export class SqliteGiveawayCreationRepository
            from publication_deliveries d
            join publication_runs r on r.id = d.publication_run_id
            join giveaway_channels c on c.id = d.giveaway_channel_id
-          where r.giveaway_id = ? and r.status = 'succeeded'
+          where r.giveaway_id = ?
+            and (
+              (? = 'active' and r.status = 'succeeded')
+              or (? = 'failed' and r.status = 'failed' and r.id = ?)
+            )
             and d.status = 'delivered' and d.message_id is not null
           order by d.created_at, d.id`,
-        [input.giveawayId],
+        [
+          input.giveawayId,
+          giveaway.state,
+          giveaway.state,
+          giveaway.failureRunId,
+        ],
       );
       if (input.syncTaskIds.length < deliveries.length) {
         throw new Error('Missing synchronization task identifiers');
@@ -1315,6 +1543,37 @@ export class SqliteGiveawayCreationRepository
       throw new Error('Failed to persist pending channel connection');
     }
     return connection;
+  }
+
+  async #assertChannelMutationAllowed(
+    database: DatabaseBoundary,
+    giveawayId: string,
+  ): Promise<void> {
+    const error = await this.#channelMutationGuardError(database, giveawayId);
+    if (error) throw error;
+  }
+
+  async #channelMutationGuardError(
+    database: DatabaseBoundary,
+    giveawayId: string,
+  ): Promise<Error | undefined> {
+    const rows = await database.all<{ state: string; step: string | null }>(
+      `select g.state, w.step
+         from giveaways g
+         left join wizard_sessions w
+           on w.giveaway_id = g.id and w.status = 'active'
+        where g.id = ?
+        limit 1`,
+      [giveawayId],
+    );
+    const row = rows[0];
+    if (!row) return new Error('Unknown giveaway');
+    if (row.state !== 'draft' || row.step !== 'channels') {
+      return new Error(
+        'Giveaway channels can only change during the channels step',
+      );
+    }
+    return undefined;
   }
 
   async #supersedeConnection(

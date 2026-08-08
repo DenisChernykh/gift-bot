@@ -28,14 +28,20 @@ export type JoinLinkTarget = {
 
 export type CancellationTarget =
   | { kind: 'wizard' }
-  | { kind: 'giveaway'; giveawayId: string; title: string }
-  | { kind: 'none' };
+  | {
+      kind: 'giveaway';
+      giveawayId: string;
+      title: string;
+      state: 'draft' | 'active' | 'failed';
+    };
 
 export interface GiveawayManagementRepository {
   listGiveaways(administratorTelegramId: number): Promise<GiveawayListItem[]>;
   getGiveawaySummary(giveawayId: string): Promise<PublicationGiveaway>;
   findJoinLinkTarget(tokenHash: string): Promise<JoinLinkTarget | null>;
-  findCancellationTarget(administratorTelegramId: number): Promise<CancellationTarget>;
+  listCancellationTargets(
+    administratorTelegramId: number,
+  ): Promise<CancellationTarget[]>;
   cancelUnmaterializedWizard(input: {
     administratorTelegramId: number;
     now: number;

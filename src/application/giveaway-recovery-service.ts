@@ -59,11 +59,20 @@ export class GiveawayRecoveryService {
         (delivery) => delivery.status === 'delivered' && delivery.messageId !== null,
       )
     ) {
-      await this.#repository.activatePublication(
-        publication.runId,
-        this.#dependencies.now(),
-      );
-      return { giveawayId: publication.giveawayId, kind: 'activated' as const };
+      await this.#repository.failPublication({
+        publicationRunId: publication.runId,
+        failure: {
+          stage: 'activation_uncertain',
+          errorKind: 'telegram_posts_unverified',
+        },
+        now: this.#dependencies.now(),
+      });
+      this.#dependencies.logger.error('publication_failed', {
+        giveawayId: publication.giveawayId,
+        stage: 'activation_uncertain',
+        errorKind: 'telegram_posts_unverified',
+      });
+      return { giveawayId: publication.giveawayId, kind: 'failed' as const };
     }
 
     const known = publication.deliveries.filter(

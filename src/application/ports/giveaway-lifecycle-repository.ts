@@ -28,7 +28,12 @@ export type PublicationDelivery = {
   messageKind: 'text' | 'photo' | null;
 };
 
-export type PublicationFailureStage = 'send_unknown' | 'rollback_delete' | 'recovery_unknown_send' | 'recovery_rollback_delete';
+export type PublicationFailureStage =
+  | 'send_unknown'
+  | 'rollback_delete'
+  | 'recovery_unknown_send'
+  | 'recovery_rollback_delete'
+  | 'activation_uncertain';
 
 export type PublicationFailureDiagnostic = {
   stage: PublicationFailureStage | 'preflight';
@@ -64,6 +69,11 @@ export type PrepareCancellationResult =
 
 export interface GiveawayLifecycleRepository {
   getPublicationGiveaway(giveawayId: string): Promise<PublicationGiveaway>;
+  refreshPublicationChannels(input: {
+    giveawayId: string;
+    channels: PublicationChannel[];
+    now: number;
+  }): Promise<void>;
   beginPublication(input: {
     giveawayId: string;
     publicationRunId: string;
