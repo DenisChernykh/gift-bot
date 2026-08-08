@@ -355,15 +355,27 @@ async function handleCallbackAction(
       return;
     }
     case 'publish_giveaway': {
+      const giveawayId = stringPayload(action.payload, 'giveawayId');
       try {
-        const result = await dependencies.publication.publish(
-          stringPayload(action.payload, 'giveawayId'),
-        );
-        await context.reply(publicationResultText(result));
+        const result = await dependencies.publication.publish(giveawayId);
+        if (result.kind === 'failed') {
+          const persisted = (await dependencies.management.listGiveaways(actorTelegramId))
+            .find((giveaway) => giveaway.id === giveawayId);
+          await context.reply(
+            persisted?.failure
+              ? formatPublicationDiagnostic({
+                  giveawayId,
+                  diagnostic: persisted.failure,
+                })
+              : publicationResultText(result),
+          );
+        } else {
+          await context.reply(publicationResultText(result));
+        }
       } catch (error) {
         if (error instanceof PublicationFailureError) {
           await context.reply(formatPublicationDiagnostic({
-            giveawayId: stringPayload(action.payload, 'giveawayId'),
+            giveawayId,
             diagnostic: error.diagnostic,
           }));
           return;

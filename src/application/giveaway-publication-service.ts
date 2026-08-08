@@ -133,6 +133,7 @@ export class GiveawayPublicationService {
         knownDeliveries.push({
           id: delivery.id,
           giveawayChannelId: channel.id,
+          channelUsername: channel.username,
           telegramChatId: channel.telegramChatId,
           status: 'delivered',
           messageId: sent.messageId,

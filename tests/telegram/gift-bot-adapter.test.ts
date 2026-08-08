@@ -75,7 +75,7 @@ class FakeTelegramApi {
 
 class FakePublicationGateway implements TelegramGateway {
   readonly operations: string[] = [];
-  sendFailure?: Error;
+  sendResults: Array<number | Error> = [];
   #messageId = 500;
 
   async getChannelMembership() {
@@ -89,8 +89,9 @@ class FakePublicationGateway implements TelegramGateway {
 
   async sendGiveawayMessage(input: TelegramGiveawayMessage) {
     this.operations.push(`send:${input.chatId}`);
-    if (this.sendFailure) throw this.sendFailure;
-    return { messageId: ++this.#messageId };
+    const result = this.sendResults.shift() ?? ++this.#messageId;
+    if (result instanceof Error) throw result;
+    return { messageId: result };
   }
 
   async deleteMessage(chatId: number, messageId: number) {
@@ -156,6 +157,7 @@ async function openTestBot() {
     bot,
     fakeApi,
     telegramGateway,
+    repository,
     channels,
     callbacks,
   };
@@ -475,10 +477,9 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
                  'diagnostic_channel', 'Diagnostic channel', 700, 'confirmed', ?, ?)`,
       [NOW, NOW],
     );
-    telegramGateway.sendFailure = new TelegramDeliveryError(
-      'connection reset after request',
-      'unknown',
-    );
+    telegramGateway.sendResults = [
+      new TelegramDeliveryError('connection reset after request', 'unknown'),
+    ];
     const action = await callbacks.issue({
       actorTelegramId: 700,
       giveawayId: 'diagnostic-giveaway',
@@ -502,6 +503,121 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain('send_unknown');
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
       '@diagnostic_channel',
+    );
+  });
+
+  it('lists diagnostics only from the failed run bound to the giveaway', async () => {
+    const { bot, database, fakeApi, repository } = await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('bound-failure', 'Bound failure', 'publishing', 1, ?, 0,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW + 86_400_000, NOW, NOW],
+    );
+    for (const [id, chatId, username] of [
+      ['old-channel', -6201, 'old_channel'],
+      ['current-delivered', -6202, 'current_delivered'],
+      ['current-unknown', -6203, 'current_unknown'],
+    ] as const) {
+      await database.execute(
+        `insert into giveaway_channels (
+           id, giveaway_id, telegram_chat_id, username, title,
+           owner_telegram_id, status, created_at, updated_at
+         ) values (?, 'bound-failure', ?, ?, ?, 700, 'confirmed', ?, ?)`,
+        [id, chatId, username, username, NOW, NOW],
+      );
+    }
+    await database.execute(
+      `insert into publication_runs (
+         id, giveaway_id, status, failure_stage, failure_error_kind,
+         started_at, finished_at
+       ) values ('old-failed-run', 'bound-failure', 'failed',
+                 'send_unknown', 'telegram_unknown', ?, ?)`,
+      [NOW - 2_000, NOW - 1_000],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('old-delivery', 'old-failed-run', 'old-channel', 'delivered',
+                 401, 'text', ?, ?)`,
+      [NOW - 2_000, NOW - 1_000],
+    );
+    await database.execute(
+      `insert into publication_runs (id, giveaway_id, status, started_at, finished_at)
+       values ('current-failed-run', 'bound-failure', 'publishing', ?, null)`,
+      [NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values
+         ('current-delivery', 'current-failed-run', 'current-delivered',
+          'delivered', 502, 'text', ?, ?),
+         ('current-unknown-delivery', 'current-failed-run', 'current-unknown',
+          'unknown', null, null, ?, ?)`,
+      [NOW, NOW, NOW, NOW],
+    );
+
+    await repository.failPublication({
+      publicationRunId: 'current-failed-run',
+      failure: { stage: 'send_unknown', errorKind: 'telegram_unknown' },
+      now: NOW,
+    });
+    await bot.handleUpdate(privateMessageUpdate(72, 700, '/giveaways'));
+
+    const text = String(fakeApi.sentMessages().at(-1)!.payload.text);
+    expect(text).toContain('@current_delivered');
+    expect(text).toContain('https://t.me/current_delivered/502');
+    expect(text).toContain('@current_unknown');
+    expect(text).not.toContain('@old_channel');
+    expect(text).not.toContain('https://t.me/old_channel/401');
+  });
+
+  it('renders an immediate failed publish from the same persisted diagnostic card as /giveaways', async () => {
+    const { bot, database, fakeApi, telegramGateway, callbacks } = await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('callback-failure', 'Callback failure', 'draft', 1, ?, 0,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW + 86_400_000, NOW, NOW],
+    );
+    for (const [id, chatId, username] of [
+      ['callback-delivered', -6301, 'callback_delivered'],
+      ['callback-unknown', -6302, 'callback_unknown'],
+    ] as const) {
+      await database.execute(
+        `insert into giveaway_channels (
+           id, giveaway_id, telegram_chat_id, username, title,
+           owner_telegram_id, status, created_at, updated_at
+         ) values (?, 'callback-failure', ?, ?, ?, 700, 'confirmed', ?, ?)`,
+        [id, chatId, username, username, NOW, NOW],
+      );
+    }
+    telegramGateway.sendResults = [
+      551,
+      new TelegramDeliveryError('connection reset after request', 'unknown'),
+    ];
+    const action = await callbacks.issue({
+      actorTelegramId: 700,
+      giveawayId: 'callback-failure',
+      action: 'publish_giveaway',
+      payload: { giveawayId: 'callback-failure' },
+    });
+
+    await bot.handleUpdate(callbackUpdate(73, 700, `admin:${action.token}`));
+    const immediate = String(fakeApi.sentMessages().at(-1)!.payload.text);
+    expect(immediate).toContain('https://t.me/callback_delivered/551');
+    expect(immediate).toContain('@callback_unknown');
+
+    await bot.handleUpdate(privateMessageUpdate(74, 700, '/giveaways'));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
+      `Callback failure — failed\n${immediate}`,
     );
   });
 

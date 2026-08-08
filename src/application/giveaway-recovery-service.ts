@@ -33,22 +33,24 @@ export class GiveawayRecoveryService {
   }
 
   async #recover(publication: RecoverablePublication) {
-    if (
-      publication.deliveries.some((delivery) =>
-        ['sending', 'unknown'].includes(delivery.status),
-      )
-    ) {
+    const uncertainDeliveries = publication.deliveries.filter((delivery) =>
+      ['sending', 'unknown'].includes(delivery.status),
+    );
+    if (uncertainDeliveries.length > 0) {
       await this.#repository.failPublication({
         publicationRunId: publication.runId,
         failure: { stage: 'recovery_unknown_send', errorKind: 'unknown_delivery' },
         now: this.#dependencies.now(),
       });
-      this.#dependencies.logger.error('publication_failed', {
-        giveawayId: publication.giveawayId,
-        stage: 'recovery_unknown_send',
-        errorKind: 'unknown_delivery',
-        channelIds: publication.deliveries.filter((delivery) => ['sending', 'unknown', 'delivered'].includes(delivery.status)).map((delivery) => delivery.giveawayChannelId),
-      });
+      for (const delivery of uncertainDeliveries) {
+        this.#dependencies.logger.error('publication_failed', {
+          giveawayId: publication.giveawayId,
+          stage: 'recovery_unknown_send',
+          errorKind: 'unknown_delivery',
+          channelId: delivery.giveawayChannelId,
+          channelUsername: delivery.channelUsername,
+        });
+      }
       return { giveawayId: publication.giveawayId, kind: 'failed' as const };
     }
     if (
@@ -68,6 +70,7 @@ export class GiveawayRecoveryService {
       (delivery) => delivery.status === 'delivered' && delivery.messageId !== null,
     );
     const deletedDeliveryIds: string[] = [];
+    const failedDeliveries: typeof known = [];
     let complete = true;
     for (const delivery of [...known].reverse()) {
       try {
@@ -78,6 +81,7 @@ export class GiveawayRecoveryService {
         deletedDeliveryIds.push(delivery.id);
       } catch {
         complete = false;
+        failedDeliveries.push(delivery);
       }
     }
     await this.#repository.finishPublicationRollback({
@@ -87,12 +91,15 @@ export class GiveawayRecoveryService {
       ...(!complete ? { failure: { stage: 'recovery_rollback_delete' as const, errorKind: 'delete_failed' } } : {}),
       now: this.#dependencies.now(),
     });
-    if (!complete) this.#dependencies.logger.error('publication_failed', {
-      giveawayId: publication.giveawayId,
-      stage: 'recovery_rollback_delete',
-      errorKind: 'delete_failed',
-      channelIds: known.map((delivery) => delivery.giveawayChannelId),
-    });
+    for (const delivery of failedDeliveries) {
+      this.#dependencies.logger.error('publication_failed', {
+        giveawayId: publication.giveawayId,
+        stage: 'recovery_rollback_delete',
+        errorKind: 'delete_failed',
+        channelId: delivery.giveawayChannelId,
+        channelUsername: delivery.channelUsername,
+      });
+    }
     return {
       giveawayId: publication.giveawayId,
       kind: complete ? ('rolled_back' as const) : ('failed' as const),

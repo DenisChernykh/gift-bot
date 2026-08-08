@@ -36,6 +36,13 @@
       "when": 1786197000000,
       "tag": "0004_publication_failure_diagnostics",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1786199900767,
+      "tag": "0005_fixed_kitty_pryde",
+      "breakpoints": true
     }
   ]
 }

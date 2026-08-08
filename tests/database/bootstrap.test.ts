@@ -1,6 +1,7 @@
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -256,6 +257,57 @@ describe('migration command wiring', () => {
       await migrateDatabaseAt(databasePath);
       expect(existsSync(databasePath)).toBe(true);
     } finally {
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it('upgrades and reopens a pre-binding failed giveaway with its latest failed run bound', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gift-bot-upgrade-'));
+    const databasePath = join(directory, 'gift-bot.sqlite');
+    const migrationPath = fileURLToPath(
+      new URL('../../drizzle/0005_fixed_kitty_pryde.sql', import.meta.url),
+    );
+    let close: (() => Promise<void>) | undefined;
+
+    try {
+      const opened = openDatabase(databasePath);
+      close = opened.close;
+      await opened.database.execute(
+        'create table giveaways (id text primary key, state text not null)',
+      );
+      await opened.database.execute(
+        `create table publication_runs (
+           id text primary key, giveaway_id text not null, status text not null,
+           failure_stage text, finished_at integer
+         )`,
+      );
+      await opened.database.execute(
+        "insert into giveaways (id, state) values ('giveaway-1', 'failed')",
+      );
+      await opened.database.execute(
+        `insert into publication_runs (
+           id, giveaway_id, status, failure_stage, finished_at
+         ) values
+           ('old-run', 'giveaway-1', 'failed', 'send_unknown', 100),
+           ('current-run', 'giveaway-1', 'failed', 'recovery_unknown_send', 200)`,
+      );
+      for (const statement of readFileSync(migrationPath, 'utf8')
+        .split('--> statement-breakpoint')
+        .map((value) => value.trim())
+        .filter(Boolean)) {
+        await opened.database.execute(statement);
+      }
+      await close();
+
+      const reopened = openDatabase(databasePath);
+      close = reopened.close;
+      expect(
+        await reopened.database.all(
+          "select failure_run_id from giveaways where id = 'giveaway-1'",
+        ),
+      ).toEqual([{ failure_run_id: 'current-run' }]);
+    } finally {
+      await close?.();
       rmSync(directory, { force: true, recursive: true });
     }
   });

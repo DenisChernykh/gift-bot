@@ -12,6 +12,7 @@ export const giveaways = sqliteTable('giveaways', {
   contentText: text('content_text').notNull(),
   contentFileId: text('content_file_id'),
   contentEntities: text('content_entities').notNull().default('[]'),
+  failureRunId: text('failure_run_id'),
   createdByTelegramId: integer('created_by_telegram_id').notNull(),
   createdAt: integer('created_at').notNull(),
   updatedAt: integer('updated_at').notNull(),

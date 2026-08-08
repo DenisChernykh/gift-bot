@@ -21,6 +21,7 @@ export type PublicationGiveaway = {
 export type PublicationDelivery = {
   id: string;
   giveawayChannelId: string;
+  channelUsername: string;
   telegramChatId: number;
   status: string;
   messageId: number | null;

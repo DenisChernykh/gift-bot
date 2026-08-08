@@ -61,19 +61,34 @@ class FakeTelegramGateway implements TelegramGateway {
   }
 }
 
+class CapturingLogger {
+  readonly errors: Array<{
+    event: string;
+    fields: Record<string, unknown>;
+  }> = [];
+
+  error(event: string, fields: Record<string, unknown> = {}) {
+    this.errors.push({ event, fields });
+  }
+}
+
 async function openLifecycleApplication() {
   const directory = mkdtempSync(join(tmpdir(), 'gift-bot-lifecycle-'));
   const opened = openDatabase(join(directory, 'gift-bot.sqlite'));
   await migrateDatabase(opened.database);
   const repository = new SqliteGiveawayCreationRepository(opened.database);
   const gateway = new FakeTelegramGateway();
+  const logger = new CapturingLogger();
   let sequence = 0;
   const dependencies = {
     createId: (kind: 'sync_task') => `${kind}-${++sequence}`,
     now: () => NOW,
   };
   const cancellation = new GiveawayCancellationService(repository, gateway, dependencies);
-  const recovery = new GiveawayRecoveryService(repository, gateway, { now: () => NOW });
+  const recovery = new GiveawayRecoveryService(repository, gateway, {
+    now: () => NOW,
+    logger,
+  });
   const publication = new GiveawayPublicationService(repository, gateway, {
     botUsername: 'gift_test_bot',
     createId: (kind) => `${kind}-${++sequence}`,
@@ -84,7 +99,15 @@ async function openLifecycleApplication() {
     await opened.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { ...opened, repository, gateway, cancellation, publication, recovery };
+  return {
+    ...opened,
+    repository,
+    gateway,
+    logger,
+    cancellation,
+    publication,
+    recovery,
+  };
 }
 
 async function seedPublishingRun(
@@ -181,17 +204,70 @@ describe('GiveawayRecoveryService', () => {
     ]);
   });
 
-  it('marks unknown send outcomes failed on startup without retrying the send', async () => {
-    const { database, gateway, recovery } = await openLifecycleApplication();
-    await seedPublishingRun(database, ['delivered', 'unknown']);
+  it('logs each unknown or sending channel safely on startup without including known deliveries', async () => {
+    const { database, gateway, logger, recovery } = await openLifecycleApplication();
+    await seedPublishingRun(database, ['delivered', 'sending', 'unknown']);
 
     expect(await recovery.recoverPublications()).toEqual([
       { giveawayId: 'giveaway-1', kind: 'failed' },
     ]);
     expect(gateway.operations).toEqual([]);
+    expect(logger.errors).toEqual([
+      {
+        event: 'publication_failed',
+        fields: {
+          giveawayId: 'giveaway-1',
+          stage: 'recovery_unknown_send',
+          errorKind: 'unknown_delivery',
+          channelId: 'channel-2',
+          channelUsername: 'recovery_2',
+        },
+      },
+      {
+        event: 'publication_failed',
+        fields: {
+          giveawayId: 'giveaway-1',
+          stage: 'recovery_unknown_send',
+          errorKind: 'unknown_delivery',
+          channelId: 'channel-3',
+          channelUsername: 'recovery_3',
+        },
+      },
+    ]);
     expect(await database.all('select state from giveaways')).toEqual([
       { state: 'failed' },
     ]);
+  });
+
+  it('logs only channels whose rollback deletion failed and omits raw Telegram errors', async () => {
+    const { database, gateway, logger, recovery } = await openLifecycleApplication();
+    await seedPublishingRun(database, ['delivered', 'delivered', 'pending']);
+    gateway.deleteResults = [
+      new TelegramDeliveryError(
+        'BOT_TOKEN=secret tokenHash=secret raw Telegram description',
+        'definite',
+      ),
+      undefined,
+    ];
+
+    expect(await recovery.recoverPublications()).toEqual([
+      { giveawayId: 'giveaway-1', kind: 'failed' },
+    ]);
+    expect(logger.errors).toEqual([
+      {
+        event: 'publication_failed',
+        fields: {
+          giveawayId: 'giveaway-1',
+          stage: 'recovery_rollback_delete',
+          errorKind: 'delete_failed',
+          channelId: 'channel-2',
+          channelUsername: 'recovery_2',
+        },
+      },
+    ]);
+    expect(JSON.stringify(logger.errors)).not.toContain('BOT_TOKEN');
+    expect(JSON.stringify(logger.errors)).not.toContain('tokenHash');
+    expect(JSON.stringify(logger.errors)).not.toContain('raw Telegram description');
   });
 
   it('fails closed after a crash between Telegram accepting a send and saving its message id', async () => {

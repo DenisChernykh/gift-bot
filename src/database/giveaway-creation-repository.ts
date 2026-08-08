@@ -758,15 +758,18 @@ export class SqliteGiveawayCreationRepository
       messageId: number | null;
       deliveryStatus: string | null;
     }>(
-      `select r.giveaway_id as giveawayId, r.failure_stage as stage,
+      `select g.id as giveawayId, r.failure_stage as stage,
               r.failure_error_kind as errorKind, c.id as channelId,
               c.username as username, c.telegram_chat_id as telegramChatId,
               d.message_id as messageId, d.status as deliveryStatus
-         from publication_runs r
+         from giveaways g
+         join publication_runs r on r.id = g.failure_run_id
          left join publication_deliveries d on d.publication_run_id = r.id
          left join giveaway_channels c on c.id = d.giveaway_channel_id
-        where r.status = 'failed' and r.failure_stage is not null
-        order by r.finished_at desc, r.id, d.created_at, d.id`,
+        where g.created_by_telegram_id = ?
+          and r.status = 'failed' and r.failure_stage is not null
+        order by g.id, d.created_at, d.id`,
+      [administratorTelegramId],
     );
     return giveaways.map((giveaway) => {
       const rows = failures.filter((failure) => failure.giveawayId === giveaway.id);
@@ -884,7 +887,7 @@ export class SqliteGiveawayCreationRepository
       }
 
       await transaction.execute(
-        "update giveaways set state = 'publishing', updated_at = ? where id = ?",
+        "update giveaways set state = 'publishing', failure_run_id = null, updated_at = ? where id = ?",
         [input.now, input.giveawayId],
       );
       await transaction.execute(
@@ -989,7 +992,7 @@ export class SqliteGiveawayCreationRepository
         [now, publicationRunId],
       );
       await transaction.execute(
-        "update giveaways set state = 'active', updated_at = ? where id = ?",
+        "update giveaways set state = 'active', failure_run_id = null, updated_at = ? where id = ?",
         [now, run.giveawayId],
       );
       await transaction.execute(
@@ -1025,8 +1028,8 @@ export class SqliteGiveawayCreationRepository
         [input.complete ? 'rolled_back' : 'failed', input.failure?.stage ?? null, input.failure?.errorKind ?? null, input.now, input.publicationRunId],
       );
       await transaction.execute(
-        'update giveaways set state = ?, updated_at = ? where id = ?',
-        [input.complete ? 'draft' : 'failed', input.now, giveawayId],
+        'update giveaways set state = ?, failure_run_id = ?, updated_at = ? where id = ?',
+        [input.complete ? 'draft' : 'failed', input.complete ? null : input.publicationRunId, input.now, giveawayId],
       );
       await transaction.execute(
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'pending'",
@@ -1048,8 +1051,8 @@ export class SqliteGiveawayCreationRepository
         [input.failure.stage, input.failure.errorKind, input.now, input.publicationRunId],
       );
       await transaction.execute(
-        "update giveaways set state = 'failed', updated_at = ? where id = ?",
-        [input.now, giveawayId],
+        "update giveaways set state = 'failed', failure_run_id = ?, updated_at = ? where id = ?",
+        [input.publicationRunId, input.now, giveawayId],
       );
       await transaction.execute(
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state = 'pending'",
@@ -1075,12 +1078,14 @@ export class SqliteGiveawayCreationRepository
         deliveries: await this.#database.all<{
           id: string;
           giveawayChannelId: string;
+          channelUsername: string;
           telegramChatId: number;
           status: string;
           messageId: number | null;
           messageKind: 'text' | 'photo' | null;
         }>(
           `select d.id, d.giveaway_channel_id as giveawayChannelId,
+                  c.username as channelUsername,
                   c.telegram_chat_id as telegramChatId, d.status,
                   d.message_id as messageId, d.message_kind as messageKind
              from publication_deliveries d
