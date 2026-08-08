@@ -1,5 +1,12 @@
 import { sql } from 'drizzle-orm';
-import { index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import {
+  foreignKey,
+  index,
+  integer,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from 'drizzle-orm/sqlite-core';
 
 export const giveaways = sqliteTable('giveaways', {
   id: text('id').primaryKey(),
@@ -135,6 +142,93 @@ export const joinTokens = sqliteTable(
   (table) => [index('join_tokens_giveaway_index').on(table.giveawayId)],
 );
 
+export const participants = sqliteTable(
+  'participants',
+  {
+    id: text('id').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    telegramUserId: integer('telegram_user_id').notNull(),
+    username: text('username'),
+    displayName: text('display_name').notNull(),
+    inviterParticipantId: text('inviter_participant_id'),
+    joinedAt: integer('joined_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('participants_giveaway_user_unique').on(
+      table.giveawayId,
+      table.telegramUserId,
+    ),
+    uniqueIndex('participants_id_giveaway_unique').on(
+      table.id,
+      table.giveawayId,
+    ),
+    index('participants_giveaway_inviter_index').on(
+      table.giveawayId,
+      table.inviterParticipantId,
+    ),
+    foreignKey({
+      columns: [table.inviterParticipantId, table.giveawayId],
+      foreignColumns: [table.id, table.giveawayId],
+      name: 'participants_inviter_same_giveaway_fk',
+    }),
+  ],
+);
+
+export const referralTokens = sqliteTable(
+  'referral_tokens',
+  {
+    tokenHash: text('token_hash').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    inviterParticipantId: text('inviter_participant_id').notNull(),
+    state: text('state').notNull(),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [
+    index('referral_tokens_giveaway_inviter_index').on(
+      table.giveawayId,
+      table.inviterParticipantId,
+    ),
+    foreignKey({
+      columns: [table.inviterParticipantId, table.giveawayId],
+      foreignColumns: [participants.id, participants.giveawayId],
+      name: 'referral_tokens_inviter_same_giveaway_fk',
+    }),
+  ],
+);
+
+export const channelHealthAlerts = sqliteTable(
+  'channel_health_alerts',
+  {
+    id: text('id').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    giveawayChannelId: text('giveaway_channel_id')
+      .notNull()
+      .references(() => giveawayChannels.id),
+    kind: text('kind').notNull(),
+    state: text('state').notNull(),
+    firstDetectedAt: integer('first_detected_at').notNull(),
+    lastDetectedAt: integer('last_detected_at').notNull(),
+    notifiedAt: integer('notified_at'),
+    resolvedAt: integer('resolved_at'),
+  },
+  (table) => [
+    uniqueIndex('channel_health_alerts_active_unique')
+      .on(table.giveawayId, table.giveawayChannelId, table.kind)
+      .where(sql`${table.state} = 'active'`),
+    index('channel_health_alerts_pending_notification_index').on(
+      table.state,
+      table.notifiedAt,
+    ),
+  ],
+);
+
 export const publicationRuns = sqliteTable(
   'publication_runs',
   {
@@ -187,8 +281,15 @@ export const syncTasks = sqliteTable(
     payload: text('payload').notNull(),
     status: text('status').notNull(),
     attempts: integer('attempts').notNull(),
+    availableAt: integer('available_at').notNull().default(0),
+    lastErrorKind: text('last_error_kind'),
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
   },
-  (table) => [index('sync_tasks_status_index').on(table.status, table.createdAt)],
+  (table) => [
+    index('sync_tasks_status_index').on(table.status, table.availableAt),
+    uniqueIndex('sync_tasks_participant_count_unique')
+      .on(table.giveawayId, table.giveawayChannelId)
+      .where(sql`${table.taskType} = 'participant_count'`),
+  ],
 );

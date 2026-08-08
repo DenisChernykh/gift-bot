@@ -1,5 +1,6 @@
 import type { TelegramChannelMembership } from '../../domain/channel-rights.js';
 import type { GiveawayMessageEntity } from '../../domain/giveaway-validation.js';
+import type { ParticipantMembership } from '../../domain/participant-rules.js';
 
 export type TelegramMessageEntity = GiveawayMessageEntity;
 
@@ -17,6 +18,15 @@ export type TelegramCancelledMessage = {
   messageId: number;
   kind: 'text' | 'photo';
   text: string;
+};
+
+export type TelegramPostEdit = {
+  chatId: number;
+  messageId: number;
+  kind: 'text' | 'photo';
+  text: string;
+  entities: TelegramMessageEntity[];
+  removeParticipationButton: boolean;
 };
 
 export type TelegramDeliveryOutcome = 'definite' | 'unknown';
@@ -46,9 +56,15 @@ export class TelegramDeliveryError extends Error {
 
 export interface TelegramGateway {
   getChannelSnapshot(chatId: number): Promise<TelegramChannelSnapshot>;
+  getParticipantMembership(
+    chatId: number,
+    telegramUserId: number,
+  ): Promise<ParticipantMembership>;
   sendGiveawayMessage(
     input: TelegramGiveawayMessage,
   ): Promise<{ messageId: number }>;
   deleteMessage(chatId: number, messageId: number): Promise<void>;
   editCancelledMessage(input: TelegramCancelledMessage): Promise<void>;
+  editGiveawayPost(input: TelegramPostEdit): Promise<void>;
+  sendDirectMessage(chatId: number, text: string): Promise<void>;
 }

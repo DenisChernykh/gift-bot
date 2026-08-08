@@ -11,16 +11,22 @@ import { ChannelAuthorizationService } from '../../src/application/channel-autho
 import { DraftWizardService } from '../../src/application/draft-wizard-service.js';
 import { GiveawayCancellationService } from '../../src/application/giveaway-cancellation-service.js';
 import { GiveawayManagementService } from '../../src/application/giveaway-management-service.js';
+import { GiveawayPostSynchronizationService } from '../../src/application/giveaway-post-synchronization-service.js';
 import { GiveawayPublicationService } from '../../src/application/giveaway-publication-service.js';
+import { ParticipantRegistrationService } from '../../src/application/participant-registration-service.js';
 import type {
   TelegramCancelledMessage,
   TelegramGateway,
   TelegramGiveawayMessage,
+  TelegramPostEdit,
 } from '../../src/application/ports/telegram-gateway.js';
 import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
 import { openDatabase, type DatabaseBoundary } from '../../src/database/client.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
+import { SqliteParticipantRepository } from '../../src/database/participant-repository.js';
+import { SqlitePostSynchronizationRepository } from '../../src/database/post-synchronization-repository.js';
+import type { ParticipantMembership } from '../../src/domain/participant-rules.js';
 import { hashToken } from '../../src/domain/tokens.js';
 import { registerGiftBotHandlers } from '../../src/telegram/gift-bot-adapter.js';
 
@@ -77,6 +83,8 @@ class FakePublicationGateway implements TelegramGateway {
   readonly operations: string[] = [];
   sendResults: Array<number | Error> = [];
   readonly metadata = new Map<number, { username: string | null; title: string }>();
+  readonly participantMemberships = new Map<number, ParticipantMembership>();
+  readonly botAdministrator = new Map<number, boolean>();
   #messageId = 500;
 
   async getChannelSnapshot(chatId: number) {
@@ -87,12 +95,16 @@ class FakePublicationGateway implements TelegramGateway {
     return {
       ...metadata,
       membership: {
-        status: 'administrator',
+        status: this.botAdministrator.get(chatId) === false ? 'left' : 'administrator',
         canPostMessages: true,
         canEditMessages: true,
         canDeleteMessages: true,
       },
     };
+  }
+
+  async getParticipantMembership(_chatId: number, telegramUserId: number) {
+    return this.participantMemberships.get(telegramUserId) ?? { status: 'left' as const };
   }
 
   async sendGiveawayMessage(input: TelegramGiveawayMessage) {
@@ -107,7 +119,19 @@ class FakePublicationGateway implements TelegramGateway {
   }
 
   async editCancelledMessage(input: TelegramCancelledMessage) {
+    await this.editGiveawayPost({
+      ...input,
+      entities: [],
+      removeParticipationButton: true,
+    });
+  }
+
+  async editGiveawayPost(input: TelegramPostEdit) {
     this.operations.push(`edit:${input.chatId}:${input.messageId}`);
+  }
+
+  async sendDirectMessage(chatId: number) {
+    this.operations.push(`direct:${chatId}`);
   }
 }
 
@@ -117,8 +141,9 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
   await migrateDatabase(opened.database);
   const repository = new SqliteGiveawayCreationRepository(opened.database);
   let sequence = 0;
+  let currentNow = NOW;
   const createId = (kind: string) => `${kind}-${++sequence}`;
-  const now = () => NOW;
+  const now = () => currentNow;
   const wizard = new DraftWizardService(repository, { createId, now });
   const channels = new ChannelAuthorizationService(repository, { createId, now });
   const callbacks = new CallbackActionService(repository, {
@@ -135,9 +160,29 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     createToken: () => ({ token: 'join-token', tokenHash: hashToken('join-token') }),
     now,
   });
+  const participantRepository = new SqliteParticipantRepository(opened.database, {
+    createId,
+  });
+  const participants = new ParticipantRegistrationService(
+    participantRepository,
+    telegramGateway,
+    {
+      botUsername: BOT_INFO.username,
+      createToken: () => {
+        const token = `referral_${String(++sequence).padStart(36, '0')}`;
+        return { token, tokenHash: hashToken(token) };
+      },
+      now,
+    },
+  );
+  const synchronization = new GiveawayPostSynchronizationService(
+    new SqlitePostSynchronizationRepository(opened.database),
+    telegramGateway,
+    { now },
+  );
   const cancellation = new GiveawayCancellationService(
     repository,
-    telegramGateway,
+    synchronization,
     { createId, now },
   );
   const management = new GiveawayManagementService(repository, { now });
@@ -156,6 +201,7 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     publication,
     cancellation,
     management,
+    participants,
   });
   cleanups.push(async () => {
     await opened.close();
@@ -169,7 +215,11 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     repository,
     channels,
     callbacks,
+    participants,
     teamTelegramIds,
+    advanceTime: (milliseconds: number) => {
+      currentNow += milliseconds;
+    },
   };
 }
 
@@ -459,8 +509,8 @@ describe('grammY Gift Bot adapter channel and join routes', () => {
     ).toEqual([]);
   });
 
-  it('returns an explicit Epic 2 boundary for an active join_ link and creates no participant', async () => {
-    const { bot, database, fakeApi } = await openTestBot();
+  it('registers an active join_ link idempotently without requiring a username', async () => {
+    const { bot, database, fakeApi, telegramGateway } = await openTestBot();
     await database.execute(
       `insert into giveaways (
          id, title, state, winner_count, deadline_utc, referrals_enabled,
@@ -474,19 +524,124 @@ describe('grammY Gift Bot adapter channel and join routes', () => {
        values (?, 'active-giveaway', 'active', null, ?)`,
       [hashToken('active-join'), NOW],
     );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('active-channel', 'active-giveaway', -4100, 'active_channel',
+                 'Active Channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    telegramGateway.participantMemberships.set(900, { status: 'member' });
 
     await bot.handleUpdate(
       privateMessageUpdate(20, 900, '/start join_active-join'),
     );
+    await bot.handleUpdate(
+      privateMessageUpdate(21, 900, '/start join_active-join'),
+    );
 
+    expect(fakeApi.sentMessages().at(-2)!.payload.text).toContain(
+      'Вы зарегистрированы',
+    );
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
-      'Регистрация участников появится в Epic 2',
+      'Вы уже зарегистрированы',
     );
     expect(
-      await database.all<{ count: number }>(
-        "select count(*) as count from sqlite_master where type = 'table' and name = 'participants'",
+      await database.all(
+        `select telegram_user_id, username, display_name
+           from participants`,
       ),
-    ).toEqual([{ count: 0 }]);
+    ).toEqual([
+      {
+        telegram_user_id: 900,
+        username: null,
+        display_name: 'User 900',
+      },
+    ]);
+  });
+
+  it('keeps referral retry actor-bound, stores only the inviter candidate, and replays idempotently', async () => {
+    const { bot, database, fakeApi, telegramGateway, advanceTime } =
+      await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('ref-giveaway', 'Referral gift', 'active', 1, ?, 1,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW + 86_400_000, NOW, NOW],
+    );
+    await database.execute(
+      `insert into join_tokens (token_hash, giveaway_id, state, expires_at, created_at)
+       values (?, 'ref-giveaway', 'active', null, ?)`,
+      [hashToken('ref-join'), NOW],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('ref-channel', 'ref-giveaway', -4200, 'ref_channel',
+                 'Referral Channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    telegramGateway.participantMemberships.set(800, { status: 'member' });
+    await bot.handleUpdate(privateMessageUpdate(22, 800, '/start join_ref-join'));
+    advanceTime(1);
+    const inviterMessage = fakeApi.sentMessages().at(-1)!;
+    const inviterMarkup = inviterMessage.payload.reply_markup as {
+      inline_keyboard: Array<Array<{ url?: string }>>;
+    };
+    const referralUrl = inviterMarkup.inline_keyboard.flat().find((button) =>
+      button.url?.includes('?start=ref_'),
+    )?.url;
+    if (!referralUrl) throw new Error('Missing referral URL');
+    const referralToken = referralUrl.split('?start=ref_')[1]!;
+
+    telegramGateway.participantMemberships.set(900, { status: 'left' });
+    await bot.handleUpdate(
+      privateMessageUpdate(23, 900, `/start ref_${referralToken}`),
+    );
+    const missingMessage = fakeApi.sentMessages().at(-1)!;
+    expect(missingMessage.payload.text).toContain('Подпишитесь на все каналы');
+    const missingMarkup = missingMessage.payload.reply_markup as {
+      inline_keyboard: Array<Array<{ text: string; url?: string }>>;
+    };
+    expect(
+      missingMarkup.inline_keyboard.flat().find((button) => button.url)?.url,
+    ).toBe('https://t.me/ref_channel');
+    const retryData = callbackData(missingMessage, 'Проверить подписку');
+    expect(retryData).toMatch(/^participant:/);
+    const [{ payload }] = await database.all<{ payload: string }>(
+      "select payload from callback_actions where action = 'participant_recheck'",
+    );
+    expect(payload).not.toContain(referralToken);
+    expect(JSON.parse(payload)).toMatchObject({
+      giveawayId: 'ref-giveaway',
+      inviterParticipantId: expect.any(String),
+    });
+
+    await bot.handleUpdate(callbackUpdate(24, 901, retryData));
+    expect(
+      fakeApi.calls
+        .filter((call) => call.method === 'answerCallbackQuery')
+        .at(-1)!.payload.text,
+    ).toBe('Действие недоступно.');
+
+    telegramGateway.participantMemberships.set(900, { status: 'member' });
+    await bot.handleUpdate(callbackUpdate(25, 900, retryData));
+    await bot.handleUpdate(callbackUpdate(26, 900, retryData));
+    expect(fakeApi.sentMessages().at(-2)!.payload.text).toContain(
+      'Вы зарегистрированы',
+    );
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'Вы уже зарегистрированы',
+    );
+    expect(
+      await database.all(
+        "select count(*) as count from participants where giveaway_id = 'ref-giveaway'",
+      ),
+    ).toEqual([{ count: 2 }]);
   });
 });
 
@@ -573,8 +728,8 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
 
   it('sends exact-limit text and photo previews separately from the short controls summary', async () => {
     for (const content of [
-      { kind: 'text' as const, value: 'x'.repeat(4005), limit: 4096 },
-      { kind: 'photo' as const, value: 'x'.repeat(933), limit: 1024 },
+      { kind: 'text' as const, value: 'x'.repeat(3959), limit: 4096 },
+      { kind: 'photo' as const, value: 'x'.repeat(887), limit: 1024 },
     ]) {
       const { bot, database, fakeApi } = await openTestBot();
       const giveawayId = `limit-${content.kind}`;
@@ -621,7 +776,7 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
           ? contentCall.payload.caption
           : contentCall.payload.text,
       );
-      expect(finalText).toHaveLength(content.limit);
+      expect(finalText).toHaveLength(content.limit - 15);
       expect(contentCall.payload.reply_markup).toBeUndefined();
 
       const summary = fakeApi.sentMessages().at(-1)!;
@@ -803,7 +958,55 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
 
     await bot.handleUpdate(privateMessageUpdate(74, 700, '/giveaways'));
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
-      `Callback failure — failed\n${immediate}`,
+      `Callback failure — failed\nУчастников: 0\nРефералы: выключены\nСинхронизация: актуально\n${immediate}`,
+    );
+  });
+
+  it('shows participant totals, referral mode, synchronization, and active rights warnings in /giveaways', async () => {
+    const { bot, database, fakeApi } = await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('health-card', 'Health card', 'active', 1, ?, 1,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW + 86_400_000, NOW, NOW],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('health-channel', 'health-card', -6401, 'health_channel',
+                 'Health Channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into participants (
+         id, giveaway_id, telegram_user_id, username, display_name,
+         inviter_participant_id, joined_at, updated_at
+       ) values ('health-participant', 'health-card', 900, null, 'Guest', null, ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into sync_tasks (
+         id, giveaway_id, giveaway_channel_id, task_type, payload,
+         status, attempts, available_at, created_at, updated_at
+       ) values ('health-sync', 'health-card', 'health-channel',
+                 'participant_count', '{}', 'pending', 0, ?, ?, ?)`,
+      [NOW, NOW, NOW],
+    );
+    await database.execute(
+      `insert into channel_health_alerts (
+         id, giveaway_id, giveaway_channel_id, kind, state,
+         first_detected_at, last_detected_at
+       ) values ('health-alert', 'health-card', 'health-channel',
+                 'bot_admin_rights_lost', 'active', ?, ?)`,
+      [NOW, NOW],
+    );
+
+    await bot.handleUpdate(privateMessageUpdate(75, 700, '/giveaways'));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
+      'Health card — active\nУчастников: 1\nРефералы: включены\nСинхронизация: ожидает синхронизации\n⚠️ Бот не администратор @health_channel («Health Channel»).',
     );
   });
 
@@ -878,9 +1081,9 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     await bot.handleUpdate(privateMessageUpdate(90, 700, '/giveaways'));
     const cards = fakeApi.sentMessages().slice(-3);
     expect(cards.map((card) => card.payload.text)).toEqual([
-      'Failed choice — failed',
-      'Active choice — active',
-      'Draft choice — draft',
+      'Failed choice — failed\nУчастников: 0\nРефералы: выключены\nСинхронизация: актуально',
+      'Active choice — active\nУчастников: 0\nРефералы: выключены\nСинхронизация: актуально',
+      'Draft choice — draft\nУчастников: 0\nРефералы: выключены\nСинхронизация: актуально',
     ]);
     const failedCardAction = callbackData(cards[0]!, 'Отменить');
     const actionPayloads = await database.all<{ payload: string }>(

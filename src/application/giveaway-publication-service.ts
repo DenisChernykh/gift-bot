@@ -1,5 +1,8 @@
 import { hasPublicationAdministratorRights } from '../domain/channel-rights.js';
-import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
+import {
+  MAXIMUM_PARTICIPANT_COUNT,
+  renderGiveawayMessage,
+} from '../domain/giveaway-rendering.js';
 import { createStoredToken } from '../domain/tokens.js';
 import type {
   GiveawayLifecycleRepository,
@@ -70,6 +73,7 @@ export class GiveawayPublicationService {
     if (giveaway.channels.length === 0) {
       throw new Error('At least one confirmed channel is required');
     }
+    renderGiveawayMessage(giveaway, MAXIMUM_PARTICIPANT_COUNT);
 
     const refreshedChannels: PublicationGiveaway['channels'] = [];
     for (const channel of giveaway.channels) {

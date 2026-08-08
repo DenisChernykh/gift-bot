@@ -96,6 +96,45 @@ describe('GrammyTelegramGateway cancellation edits', () => {
       retryAfterMs: null,
     });
   });
+
+  it('preserves the participation keyboard for counters and removes it for cancellation', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const api = {
+      editMessageText: async (
+        _chatId: number,
+        _messageId: number,
+        _text: string,
+        options: Record<string, unknown>,
+      ) => {
+        calls.push(options);
+        return true;
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await gateway.editGiveawayPost({
+      chatId: -1001,
+      messageId: 42,
+      kind: 'text',
+      text: 'Updated',
+      entities: [{ type: 'bold', offset: 0, length: 7 }],
+      removeParticipationButton: false,
+    });
+    await gateway.editCancelledMessage({
+      chatId: -1001,
+      messageId: 42,
+      kind: 'text',
+      text: 'Cancelled',
+    });
+
+    expect(calls[0]).toEqual({
+      entities: [{ type: 'bold', offset: 0, length: 7 }],
+    });
+    expect(calls[1]).toEqual({
+      entities: [],
+      reply_markup: { inline_keyboard: [] },
+    });
+  });
 });
 
 describe('GrammyTelegramGateway channel preflight', () => {
@@ -146,6 +185,58 @@ describe('GrammyTelegramGateway channel preflight', () => {
       },
     });
     expect(calls).toEqual(['chat:-1001', 'member:-1001:999']);
+  });
+
+  it.each([
+    [{ status: 'creator' }, { status: 'creator' }],
+    [{ status: 'administrator' }, { status: 'administrator' }],
+    [{ status: 'member' }, { status: 'member' }],
+    [
+      { status: 'restricted', is_member: true },
+      { status: 'restricted', isMember: true },
+    ],
+    [
+      { status: 'restricted', is_member: false },
+      { status: 'restricted', isMember: false },
+    ],
+    [{ status: 'left' }, { status: 'left' }],
+    [{ status: 'kicked' }, { status: 'kicked' }],
+    [{ status: 'future_status' }, { status: 'unknown' }],
+  ])('normalizes participant membership %o', async (member, expected) => {
+    const api = {
+      getChatMember: async () => ({
+        ...member,
+        user: { id: 900, is_bot: false, first_name: 'Participant' },
+      }),
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await expect(gateway.getParticipantMembership(-1001, 900)).resolves.toEqual(
+      expected,
+    );
+  });
+
+  it('classifies participant membership 429 without retrying it', async () => {
+    const api = {
+      getChatMember: async () => {
+        throw new GrammyError(
+          'rate limited',
+          {
+            ok: false,
+            error_code: 429,
+            description: 'Too Many Requests',
+            parameters: { retry_after: 11 },
+          },
+          'getChatMember',
+          { chat_id: -1001, user_id: 900 },
+        );
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await expect(
+      gateway.getParticipantMembership(-1001, 900),
+    ).rejects.toMatchObject({ retryAfterMs: 11_000 });
   });
 });
 

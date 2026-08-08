@@ -5,6 +5,10 @@ import type { ChannelAuthorizationService } from '../application/channel-authori
 import type { DraftWizardService } from '../application/draft-wizard-service.js';
 import type { GiveawayCancellationService } from '../application/giveaway-cancellation-service.js';
 import type { GiveawayManagementService } from '../application/giveaway-management-service.js';
+import type {
+  ParticipantRegistrationResult,
+  ParticipantRegistrationService,
+} from '../application/participant-registration-service.js';
 import { PublicationFailureError, type GiveawayPublicationService } from '../application/giveaway-publication-service.js';
 import type { ActiveWizard } from '../application/ports/giveaway-creation-repository.js';
 import type { GiveawayMessageEntity } from '../domain/giveaway-validation.js';
@@ -12,6 +16,7 @@ import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
 
 const ADMIN_CALLBACK_PREFIX = 'admin:';
 const EXTERNAL_CALLBACK_PREFIX = 'external:';
+const PARTICIPANT_CALLBACK_PREFIX = 'participant:';
 const DENIED_MESSAGE = 'Эта команда недоступна.';
 const START_CHANNEL_URL_SUFFIX =
   '?startchannel&admin=post_messages+edit_messages+delete_messages';
@@ -25,6 +30,7 @@ export type GiftBotHandlersDependencies = {
   publication: GiveawayPublicationService;
   cancellation: GiveawayCancellationService;
   management: GiveawayManagementService;
+  participants: ParticipantRegistrationService;
 };
 
 export function registerGiftBotHandlers(
@@ -38,7 +44,21 @@ export function registerGiftBotHandlers(
       return;
     }
     if (payload.startsWith('join_')) {
-      await handleJoinStart(context, payload.slice(5), dependencies);
+      await handleParticipantStart(
+        context,
+        'join',
+        payload.slice(5),
+        dependencies,
+      );
+      return;
+    }
+    if (payload.startsWith('ref_')) {
+      await handleParticipantStart(
+        context,
+        'referral',
+        payload.slice(4),
+        dependencies,
+      );
       return;
     }
     if (!(await requireAdministrator(context, dependencies))) return;
@@ -126,20 +146,25 @@ export function registerGiftBotHandlers(
     const data = context.callbackQuery.data;
     const isAdminAction = data.startsWith(ADMIN_CALLBACK_PREFIX);
     const isExternalAction = data.startsWith(EXTERNAL_CALLBACK_PREFIX);
+    const isParticipantAction = data.startsWith(PARTICIPANT_CALLBACK_PREFIX);
     if (isAdminAction && !dependencies.teamTelegramIds.has(context.from.id)) {
       await context.answerCallbackQuery({ text: DENIED_MESSAGE });
       return;
     }
-    if (!isAdminAction && !isExternalAction) {
+    if (!isAdminAction && !isExternalAction && !isParticipantAction) {
       await context.answerCallbackQuery({ text: 'Неизвестное действие.' });
       return;
     }
     const token = data.slice(
-      isAdminAction ? ADMIN_CALLBACK_PREFIX.length : EXTERNAL_CALLBACK_PREFIX.length,
+      isAdminAction
+        ? ADMIN_CALLBACK_PREFIX.length
+        : isExternalAction
+          ? EXTERNAL_CALLBACK_PREFIX.length
+          : PARTICIPANT_CALLBACK_PREFIX.length,
     );
     try {
       const action = await dependencies.callbacks.consume(token, context.from.id);
-      if (action.alreadyConsumed) {
+      if (action.alreadyConsumed && action.action !== 'participant_recheck') {
         const text = action.giveawayId
           ? `Уже обработано. Текущее состояние: ${(await dependencies.management.getGiveawaySummary(action.giveawayId)).state}.`
           : 'Уже обработано.';
@@ -303,17 +328,21 @@ async function handleExternalInviteStart(
   });
 }
 
-async function handleJoinStart(
+async function handleParticipantStart(
   context: Context,
+  kind: 'join' | 'referral',
   token: string,
   dependencies: GiftBotHandlersDependencies,
 ) {
-  const result = await dependencies.management.resolveJoinLink(token);
-  await context.reply(
-    result.kind === 'epic_2_boundary'
-      ? `Розыгрыш «${result.giveaway.title}» активен. Регистрация участников появится в Epic 2; сейчас заявка не создана.`
-      : 'Этот розыгрыш недоступен для участия.',
-  );
+  if (!context.from) return;
+  await safelyReply(context, async () => {
+    const result = await dependencies.participants.joinWithToken({
+      kind,
+      token,
+      user: participantIdentity(context),
+    });
+    await replyParticipantResult(context, result, dependencies);
+  });
 }
 
 async function handleCallbackAction(
@@ -327,6 +356,18 @@ async function handleCallbackAction(
 ) {
   const actorTelegramId = context.from!.id;
   switch (action.action) {
+    case 'participant_recheck': {
+      const result = await dependencies.participants.recheck({
+        giveawayId: stringPayload(action.payload, 'giveawayId'),
+        inviterParticipantId: nullableStringPayload(
+          action.payload,
+          'inviterParticipantId',
+        ),
+        user: participantIdentity(context),
+      });
+      await replyParticipantResult(context, result, dependencies);
+      return;
+    }
     case 'set_referrals': {
       const updated = await dependencies.wizard.submitReferrals(
         actorTelegramId,
@@ -476,6 +517,102 @@ async function handleCallbackAction(
       await dependencies.management.cancelUnmaterializedWizard(actorTelegramId);
       await context.reply('Текущий мастер отменён.');
   }
+}
+
+async function replyParticipantResult(
+  context: Context,
+  result: ParticipantRegistrationResult,
+  dependencies: GiftBotHandlersDependencies,
+): Promise<void> {
+  if (result.kind === 'unavailable') {
+    await context.reply('Этот розыгрыш недоступен для участия.');
+    return;
+  }
+  if (result.kind === 'registered') {
+    const lines = [
+      result.created
+        ? `Вы зарегистрированы в розыгрыше «${result.title}».`
+        : `Вы уже зарегистрированы в розыгрыше «${result.title}».`,
+      `Зарегистрировано участников: ${result.participantCount}.`,
+    ];
+    let keyboard: InlineKeyboard | undefined;
+    if (result.referralUrl) {
+      lines.push(
+        `Прямых рефералов: ${result.directReferralCount}. Билетов по текущему прогрессу: ${result.ticketCount}.`,
+        `Прогресс до следующего билета: ${result.directReferralCount % 3}/3.`,
+      );
+      keyboard = new InlineKeyboard().url(
+        'Моя реферальная ссылка',
+        result.referralUrl,
+      );
+    }
+    await context.reply(lines.join('\n'), {
+      ...(keyboard ? { reply_markup: keyboard } : {}),
+    });
+    return;
+  }
+
+  const retryData = await issueParticipantRecheck(
+    dependencies,
+    context.from!.id,
+    result.giveawayId,
+    result.inviterParticipantId,
+  );
+  if (result.kind === 'missing_memberships') {
+    const keyboard = new InlineKeyboard();
+    for (const channel of result.channels) {
+      keyboard
+        .url(`Подписаться @${channel.username}`, `https://t.me/${channel.username}`)
+        .row();
+    }
+    keyboard.text('Проверить подписку', retryData);
+    await context.reply(
+      'Подпишитесь на все каналы розыгрыша и затем повторите проверку.',
+      { reply_markup: keyboard },
+    );
+    return;
+  }
+
+  const wait =
+    result.retryAfterMs === null
+      ? ''
+      : ` Telegram рекомендует подождать ${Math.ceil(result.retryAfterMs / 1000)} сек.`;
+  await context.reply(
+    `Не удалось подтвердить условия участия.${wait} Попробуйте ещё раз.`,
+    {
+      reply_markup: new InlineKeyboard().text(
+        'Проверить ещё раз',
+        retryData,
+      ),
+    },
+  );
+}
+
+async function issueParticipantRecheck(
+  dependencies: GiftBotHandlersDependencies,
+  actorTelegramId: number,
+  giveawayId: string,
+  inviterParticipantId: string | null,
+): Promise<string> {
+  const action = await dependencies.callbacks.issue({
+    actorTelegramId,
+    giveawayId,
+    action: 'participant_recheck',
+    payload: { giveawayId, inviterParticipantId },
+  });
+  return `${PARTICIPANT_CALLBACK_PREFIX}${action.token}`;
+}
+
+function participantIdentity(context: Context) {
+  const from = context.from;
+  if (!from) throw new Error('Participant identity is unavailable');
+  return {
+    telegramUserId: from.id,
+    username: from.username ?? null,
+    displayName: [from.first_name, from.last_name]
+      .filter((value): value is string => Boolean(value?.trim()))
+      .join(' '),
+  };
 }
 
 type CancellationSelection = Awaited<
@@ -699,6 +836,16 @@ function stringPayload(payload: Record<string, unknown>, key: string): string {
   return value;
 }
 
+function nullableStringPayload(
+  payload: Record<string, unknown>,
+  key: string,
+): string | null {
+  const value = payload[key];
+  if (value === null) return null;
+  if (typeof value !== 'string') throw new Error(`Missing ${key}`);
+  return value;
+}
+
 function numberPayload(payload: Record<string, unknown>, key: string): number {
   const value = payload[key];
   if (typeof value !== 'number') throw new Error(`Missing ${key}`);
@@ -723,7 +870,29 @@ function publicationResultText(result: Awaited<ReturnType<GiveawayPublicationSer
 }
 
 function formatGiveawayListItem(item: Awaited<ReturnType<GiveawayManagementService['listGiveaways']>>[number]) {
-  return `${item.title} — ${item.state}${item.failure ? `\n${formatPublicationDiagnostic({ giveawayId: item.id, diagnostic: item.failure })}` : ''}`;
+  const synchronization = {
+    up_to_date: 'актуально',
+    pending: 'ожидает синхронизации',
+    processing: 'синхронизируется',
+  }[item.synchronizationState];
+  const warnings = item.warnings
+    .map(
+      (warning) =>
+        `⚠️ Бот не администратор @${warning.username} («${warning.title}»).`,
+    )
+    .join('\n');
+  return [
+    `${item.title} — ${item.state}`,
+    `Участников: ${item.participantCount}`,
+    `Рефералы: ${item.referralsEnabled ? 'включены' : 'выключены'}`,
+    `Синхронизация: ${synchronization}`,
+    warnings,
+    item.failure
+      ? formatPublicationDiagnostic({ giveawayId: item.id, diagnostic: item.failure })
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function formatPublicationDiagnostic(input: {

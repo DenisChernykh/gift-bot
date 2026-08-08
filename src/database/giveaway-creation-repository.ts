@@ -29,7 +29,6 @@ import type {
 import type {
   GiveawayListItem,
   GiveawayManagementRepository,
-  JoinLinkTarget,
 } from '../application/ports/giveaway-management-repository.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
 import { renderCancelledGiveawayMessage } from '../domain/giveaway-cancellation-rendering.js';
@@ -919,12 +918,57 @@ export class SqliteGiveawayCreationRepository
   async listGiveaways(
     administratorTelegramId: number,
   ): Promise<GiveawayListItem[]> {
-    const giveaways = await this.#database.all<GiveawayListItem>(
-      `select id, title, state, updated_at as updatedAt
-         from giveaways where created_by_telegram_id = ?
+    const giveawayRows = await this.#database.all<{
+      id: string;
+      title: string;
+      state: string;
+      updatedAt: number;
+      participantCount: number;
+      referralsEnabled: number;
+      synchronizationState: 'up_to_date' | 'pending' | 'processing';
+    }>(
+      `select g.id, g.title, g.state, g.updated_at as updatedAt,
+              (select count(*) from participants p
+                where p.giveaway_id = g.id) as participantCount,
+              g.referrals_enabled as referralsEnabled,
+              case
+                when exists (
+                  select 1 from sync_tasks s
+                   where s.giveaway_id = g.id and s.status = 'processing'
+                ) then 'processing'
+                when exists (
+                  select 1 from sync_tasks s
+                   where s.giveaway_id = g.id and s.status = 'pending'
+                ) then 'pending'
+                else 'up_to_date'
+              end as synchronizationState
+         from giveaways g where g.created_by_telegram_id = ?
          order by updated_at desc, id`,
       [administratorTelegramId],
     );
+    const warningRows = await this.#database.all<{
+      giveawayId: string;
+      channelId: string;
+      username: string;
+      title: string;
+    }>(
+      `select a.giveaway_id as giveawayId, c.id as channelId,
+              c.username, c.title
+         from channel_health_alerts a
+         join giveaways g on g.id = a.giveaway_id
+         join giveaway_channels c on c.id = a.giveaway_channel_id
+        where g.created_by_telegram_id = ?
+          and a.kind = 'bot_admin_rights_lost' and a.state = 'active'
+        order by a.first_detected_at, a.id`,
+      [administratorTelegramId],
+    );
+    const giveaways: GiveawayListItem[] = giveawayRows.map((giveaway) => ({
+      ...giveaway,
+      referralsEnabled: giveaway.referralsEnabled === 1,
+      warnings: warningRows
+        .filter((warning) => warning.giveawayId === giveaway.id)
+        .map(({ channelId, username, title }) => ({ channelId, username, title })),
+    }));
     const failures = await this.#database.all<{
       giveawayId: string;
       stage: string;
@@ -968,16 +1012,6 @@ export class SqliteGiveawayCreationRepository
         },
       };
     });
-  }
-
-  async findJoinLinkTarget(tokenHash: string): Promise<JoinLinkTarget | null> {
-    const rows = await this.#database.all<JoinLinkTarget>(
-      `select g.id, g.title, g.state as giveawayState, t.state as tokenState
-         from join_tokens t join giveaways g on g.id = t.giveaway_id
-        where t.token_hash = ?`,
-      [tokenHash],
-    );
-    return rows[0] ?? null;
   }
 
   async listCancellationTargets(
@@ -1377,6 +1411,16 @@ export class SqliteGiveawayCreationRepository
       await transaction.execute(
         "update join_tokens set state = 'revoked' where giveaway_id = ? and state in ('active', 'pending')",
         [input.giveawayId],
+      );
+      await transaction.execute(
+        "update referral_tokens set state = 'revoked' where giveaway_id = ? and state = 'active'",
+        [input.giveawayId],
+      );
+      await transaction.execute(
+        `update sync_tasks set status = 'superseded', updated_at = ?
+          where giveaway_id = ? and task_type = 'participant_count'
+            and status in ('pending', 'processing')`,
+        [input.now, input.giveawayId],
       );
 
       if (giveaway.state === 'draft') {

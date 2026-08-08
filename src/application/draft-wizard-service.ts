@@ -5,6 +5,10 @@ import {
   validateWinnerCount,
   type GiveawayContent,
 } from '../domain/giveaway-validation.js';
+import {
+  MAXIMUM_PARTICIPANT_COUNT,
+  renderGiveawayMessage,
+} from '../domain/giveaway-rendering.js';
 import type {
   ActiveWizard,
   GiveawayCreationRepository,
@@ -107,6 +111,29 @@ export class DraftWizardService {
     value: GiveawayContent,
   ): Promise<ActiveWizard> {
     const content = validateGiveawayContent(value);
+    const wizard = await this.#repository.findActiveWizard(
+      administratorTelegramId,
+    );
+    if (wizard?.step === 'content') {
+      const { title, winnerCount, deadlineUtc } = wizard.draft;
+      if (
+        title === undefined ||
+        winnerCount === undefined ||
+        deadlineUtc === undefined
+      ) {
+        throw new Error('Giveaway draft is incomplete');
+      }
+      renderGiveawayMessage(
+        {
+          title,
+          winnerCount,
+          deadlineUtc,
+          referralsEnabled: wizard.draft.referralsEnabled,
+          content,
+        },
+        MAXIMUM_PARTICIPANT_COUNT,
+      );
+    }
     const now = this.#dependencies.now();
     const giveawayId = this.#dependencies.createId('giveaway');
     return this.#repository.advanceWizard({

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { GrammyError, type Api } from 'grammy';
 
 import { GiveawayCancellationService } from '../../src/application/giveaway-cancellation-service.js';
+import { GiveawayPostSynchronizationService } from '../../src/application/giveaway-post-synchronization-service.js';
 import { GiveawayPublicationService } from '../../src/application/giveaway-publication-service.js';
 import { GiveawayRecoveryService } from '../../src/application/giveaway-recovery-service.js';
 import {
@@ -13,10 +14,12 @@ import {
   type TelegramCancelledMessage,
   type TelegramGateway,
   type TelegramGiveawayMessage,
+  type TelegramPostEdit,
 } from '../../src/application/ports/telegram-gateway.js';
 import { openDatabase, type DatabaseBoundary } from '../../src/database/client.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
+import { SqlitePostSynchronizationRepository } from '../../src/database/post-synchronization-repository.js';
 import { hashToken } from '../../src/domain/tokens.js';
 import { GrammyTelegramGateway } from '../../src/infrastructure/grammy-telegram-gateway.js';
 
@@ -63,6 +66,10 @@ class FakeTelegramGateway implements TelegramGateway {
     const result = this.editResults.shift();
     if (result instanceof Error) throw result;
   }
+
+  async editGiveawayPost(input: TelegramPostEdit) {
+    await this.editCancelledMessage(input);
+  }
 }
 
 class CapturingLogger {
@@ -88,7 +95,16 @@ async function openLifecycleApplication() {
     createId: (kind: 'sync_task') => `${kind}-${++sequence}`,
     now: () => NOW,
   };
-  const cancellation = new GiveawayCancellationService(repository, gateway, dependencies);
+  const synchronization = new GiveawayPostSynchronizationService(
+    new SqlitePostSynchronizationRepository(opened.database),
+    gateway,
+    { now: () => NOW },
+  );
+  const cancellation = new GiveawayCancellationService(
+    repository,
+    synchronization,
+    dependencies,
+  );
   const recovery = new GiveawayRecoveryService(repository, gateway, {
     now: () => NOW,
     logger,
@@ -109,6 +125,7 @@ async function openLifecycleApplication() {
     gateway,
     logger,
     cancellation,
+    synchronization,
     publication,
     recovery,
   };
@@ -370,7 +387,7 @@ describe('GiveawayCancellationService', () => {
         { state: 'cancelled' },
       ]);
       expect(await database.all('select status from sync_tasks order by id')).toEqual([
-        { status: 'pending' },
+        { status: 'processing' },
         { status: 'pending' },
       ]);
       gateway.beforeEdit = undefined;
@@ -385,6 +402,69 @@ describe('GiveawayCancellationService', () => {
     ).toEqual([
       { status: 'completed', attempts: 1 },
       { status: 'pending', attempts: 1 },
+    ]);
+  });
+
+  it('supersedes a pending participant counter before the final cancellation edit', async () => {
+    const { database, gateway, cancellation } = await openLifecycleApplication();
+    await seedGiveaway(database, 'active', 1);
+    await database.execute(
+      `insert into publication_runs (id, giveaway_id, status, started_at, finished_at)
+       values ('run-active', 'giveaway-1', 'succeeded', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('delivery-1', 'run-active', 'channel-1', 'delivered', 302,
+                 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into sync_tasks (
+         id, giveaway_id, giveaway_channel_id, task_type, payload, status,
+         attempts, available_at, created_at, updated_at
+       ) values ('counter-before-cancel', 'giveaway-1', 'channel-1',
+                 'participant_count', '{"targetCount":1}', 'pending', 0, ?, ?, ?)`,
+      [NOW, NOW, NOW],
+    );
+    await database.execute(
+      `insert into join_tokens (
+         token_hash, giveaway_id, state, expires_at, created_at
+       ) values ('join-active', 'giveaway-1', 'active', null, ?)`,
+      [NOW],
+    );
+    await database.execute(
+      `insert into participants (
+         id, giveaway_id, telegram_user_id, username, display_name,
+         inviter_participant_id, joined_at, updated_at
+       ) values ('participant-1', 'giveaway-1', 900, null, 'Guest', null, ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into referral_tokens (
+         token_hash, giveaway_id, inviter_participant_id, state, created_at
+       ) values ('referral-active', 'giveaway-1', 'participant-1', 'active', ?)`,
+      [NOW],
+    );
+
+    await cancellation.cancel('giveaway-1');
+
+    expect(gateway.operations).toEqual(['edit:-2001:302']);
+    expect(
+      await database.all(
+        'select task_type, status from sync_tasks order by task_type',
+      ),
+    ).toEqual([
+      { task_type: 'cancel_message', status: 'completed' },
+      { task_type: 'participant_count', status: 'superseded' },
+    ]);
+    expect(await database.all('select state from join_tokens')).toEqual([
+      { state: 'revoked' },
+    ]);
+    expect(await database.all('select state from referral_tokens')).toEqual([
+      { state: 'revoked' },
     ]);
   });
 
@@ -454,7 +534,11 @@ describe('GiveawayCancellationService', () => {
     } as unknown as Api;
     const cancellation = new GiveawayCancellationService(
       repository,
-      new GrammyTelegramGateway(api, 999),
+      new GiveawayPostSynchronizationService(
+        new SqlitePostSynchronizationRepository(database),
+        new GrammyTelegramGateway(api, 999),
+        { now: () => NOW },
+      ),
       { now: () => NOW },
     );
 

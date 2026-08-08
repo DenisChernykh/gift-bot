@@ -30,7 +30,11 @@ describe('GiftBotRuntime', () => {
         },
       },
       { recoverPublications: async () => [] },
-      { retryPendingSynchronization: async () => 0 },
+      {
+        recoverInterrupted: async () => undefined,
+        retryPendingSynchronization: async () => 0,
+        waitForIdle: async () => undefined,
+      },
       async () => {
         events.push('database:close');
       },
@@ -81,9 +85,15 @@ describe('GiftBotRuntime', () => {
         },
       },
       {
+        recoverInterrupted: async () => {
+          events.push('sync:recover');
+        },
         retryPendingSynchronization: async () => {
           events.push('sync');
           return 0;
+        },
+        waitForIdle: async () => {
+          events.push('sync:idle');
         },
       },
       async () => {
@@ -100,18 +110,67 @@ describe('GiftBotRuntime', () => {
     );
 
     await runtime.start();
-    expect(events).toEqual(['recover', 'sync', 'bot:start']);
+    expect(events).toEqual(['recover', 'sync:recover', 'sync', 'bot:start']);
     scheduled?.();
     await Promise.resolve();
-    expect(events).toEqual(['recover', 'sync', 'bot:start', 'sync']);
+    expect(events).toEqual([
+      'recover',
+      'sync:recover',
+      'sync',
+      'bot:start',
+      'sync',
+    ]);
 
     await runtime.stop('SIGTERM');
     await runtime.stop('SIGTERM');
-    expect(events.slice(-3)).toEqual([
+    expect(events.slice(-4)).toEqual([
       'timer:clear:17',
       'bot:stop',
+      'sync:idle',
       'database:close',
     ]);
+  });
+
+  it('waits for an in-flight background synchronization before closing SQLite', async () => {
+    const events: string[] = [];
+    let scheduled: (() => void) | undefined;
+    const synchronizationStarted = Promise.withResolvers<void>();
+    const releaseSynchronization = Promise.withResolvers<void>();
+    let background: Promise<void> = Promise.resolve();
+    const runtime = new GiftBotRuntime(
+      { start: async () => undefined, stop: async () => events.push('bot:stop') },
+      { recoverPublications: async () => [] },
+      {
+        recoverInterrupted: async () => undefined,
+        retryPendingSynchronization: async () => 0,
+        waitForIdle: async () => background,
+      },
+      async () => events.push('database:close'),
+      {
+        logger: { info: () => undefined, error: () => undefined },
+        schedule: (operation) => {
+          scheduled = operation;
+          return 19;
+        },
+        clearSchedule: () => undefined,
+      },
+    );
+    await runtime.start();
+    background = (async () => {
+      synchronizationStarted.resolve();
+      await releaseSynchronization.promise;
+      events.push('sync:done');
+    })();
+    scheduled?.();
+    await synchronizationStarted.promise;
+
+    const stopping = runtime.stop('SIGTERM');
+    await Promise.resolve();
+    expect(events).toEqual(['bot:stop']);
+
+    releaseSynchronization.resolve();
+    await stopping;
+    expect(events).toEqual(['bot:stop', 'sync:done', 'database:close']);
   });
 });
 

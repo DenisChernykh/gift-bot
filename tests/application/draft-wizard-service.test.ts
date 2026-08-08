@@ -131,6 +131,23 @@ describe('DraftWizardService', () => {
     ]);
   });
 
+  it('reserves Telegram message capacity for a maximum safe participant count', async () => {
+    const { database, service } = await openTestApplication();
+    await service.startOrResume(306);
+    await service.submitTitle(306, 'Capacity');
+    await service.submitWinnerCount(306, 1);
+    await service.submitDeadline(306, '10.08.2026 15:30');
+    await service.submitReferrals(306, false);
+
+    await expect(
+      service.submitContent(306, {
+        kind: 'text',
+        text: 'x'.repeat(4096),
+      }),
+    ).rejects.toThrow('Final giveaway message exceeds the Telegram length limit');
+    expect(await database.all('select id from giveaways')).toEqual([]);
+  });
+
   it('persists Telegram photo file_id and caption entities without rewriting them', async () => {
     const { database, service } = await openTestApplication();
     await service.startOrResume(304);

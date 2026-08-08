@@ -5,7 +5,9 @@ import {
   type TelegramCancelledMessage,
   type TelegramGateway,
   type TelegramGiveawayMessage,
+  type TelegramPostEdit,
 } from '../application/ports/telegram-gateway.js';
+import type { ParticipantMembership } from '../domain/participant-rules.js';
 
 export function classifyTelegramError(error: unknown): TelegramDeliveryError {
   if (error instanceof GrammyError) {
@@ -71,6 +73,32 @@ export class GrammyTelegramGateway implements TelegramGateway {
     };
   }
 
+  async getParticipantMembership(
+    chatId: number,
+    telegramUserId: number,
+  ): Promise<ParticipantMembership> {
+    const member = await this.#call(() =>
+      this.#api.getChatMember(chatId, telegramUserId),
+    );
+    const status = member.status as string;
+    if (status === 'restricted') {
+      return {
+        status: 'restricted',
+        isMember: 'is_member' in member && member.is_member === true,
+      };
+    }
+    if (
+      status === 'creator' ||
+      status === 'administrator' ||
+      status === 'member' ||
+      status === 'left' ||
+      status === 'kicked'
+    ) {
+      return { status };
+    }
+    return { status: 'unknown' };
+  }
+
   async sendGiveawayMessage(
     input: TelegramGiveawayMessage,
   ): Promise<{ messageId: number }> {
@@ -96,23 +124,41 @@ export class GrammyTelegramGateway implements TelegramGateway {
     return { messageId: message.message_id };
   }
 
+  async sendDirectMessage(chatId: number, text: string): Promise<void> {
+    await this.#call(() => this.#api.sendMessage(chatId, text));
+  }
+
   async deleteMessage(chatId: number, messageId: number): Promise<void> {
     await this.#call(() => this.#api.deleteMessage(chatId, messageId));
   }
 
   async editCancelledMessage(input: TelegramCancelledMessage): Promise<void> {
+    await this.editGiveawayPost({
+      ...input,
+      entities: [],
+      removeParticipationButton: true,
+    });
+  }
+
+  async editGiveawayPost(input: TelegramPostEdit): Promise<void> {
     if (input.kind === 'photo') {
       await this.#editIdempotently(() =>
         this.#api.editMessageCaption(input.chatId, input.messageId, {
           caption: input.text,
-          reply_markup: { inline_keyboard: [] },
+          caption_entities: input.entities,
+          ...(input.removeParticipationButton
+            ? { reply_markup: { inline_keyboard: [] } }
+            : {}),
         }),
       );
       return;
     }
     await this.#editIdempotently(() =>
       this.#api.editMessageText(input.chatId, input.messageId, input.text, {
-        reply_markup: { inline_keyboard: [] },
+        entities: input.entities,
+        ...(input.removeParticipationButton
+          ? { reply_markup: { inline_keyboard: [] } }
+          : {}),
       }),
     );
   }

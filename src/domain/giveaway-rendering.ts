@@ -4,6 +4,7 @@ import { toZonedTime } from 'date-fns-tz';
 import type { GiveawayContent } from './giveaway-validation.js';
 
 const PRODUCT_TIME_ZONE = 'Asia/Yekaterinburg';
+export const MAXIMUM_PARTICIPANT_COUNT = Number.MAX_SAFE_INTEGER;
 
 type GiveawayRenderInput = {
   title: string;
@@ -24,7 +25,11 @@ export function formatGiveawayDeadline(utcMilliseconds: number): string {
 
 export function renderGiveawayMessage(
   input: GiveawayRenderInput,
+  participantCount = 0,
 ): RenderedGiveawayMessage {
+  if (!Number.isSafeInteger(participantCount) || participantCount < 0) {
+    throw new Error('Participant count must be a non-negative safe integer');
+  }
   const content = input.content.kind === 'text' ? input.content.text : input.content.caption;
   const text = [
     input.title,
@@ -34,6 +39,7 @@ export function renderGiveawayMessage(
     `Победителей: ${input.winnerCount}`,
     `Дедлайн: ${formatGiveawayDeadline(input.deadlineUtc)} (Екатеринбург, UTC+5)`,
     `Рефералы: ${input.referralsEnabled ? 'включены (3 = +1 билет)' : 'выключены'}`,
+    `Зарегистрировано участников: ${participantCount}`,
   ].join('\n');
   const maximumLength = input.content.kind === 'text' ? 4096 : 1024;
 

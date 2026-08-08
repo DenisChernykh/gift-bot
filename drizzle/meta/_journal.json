@@ -43,6 +43,13 @@
       "when": 1786199900767,
       "tag": "0005_fixed_kitty_pryde",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1786224560219,
+      "tag": "0006_wonderful_talkback",
+      "breakpoints": true
     }
   ]
 }

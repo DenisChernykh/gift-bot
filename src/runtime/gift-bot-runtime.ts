@@ -12,7 +12,9 @@ type PublicationRecovery = {
 };
 
 type CancellationSynchronization = {
+  recoverInterrupted(): Promise<void>;
   retryPendingSynchronization(): Promise<number>;
+  waitForIdle(): Promise<void>;
 };
 
 type UpdateDrain = {
@@ -94,6 +96,7 @@ export class GiftBotRuntime {
 
   async start(): Promise<void> {
     const recovered = await this.#recovery.recoverPublications();
+    await this.#cancellation.recoverInterrupted();
     const synchronized = await this.#cancellation.retryPendingSynchronization();
     this.#dependencies.logger.info('startup_recovery_completed', {
       recoveredPublicationCount: Array.isArray(recovered) ? recovered.length : 0,
@@ -118,6 +121,7 @@ export class GiftBotRuntime {
     this.#dependencies.updateDrain.stopAccepting();
     await stopPolling;
     await this.#dependencies.updateDrain.waitForIdle();
+    await this.#cancellation.waitForIdle();
     await this.#closeDatabase();
     this.#dependencies.logger.info('bot_stopped', { signal });
   }

@@ -1,8 +1,10 @@
-import type {
-  CancellationSyncTask,
-  GiveawayLifecycleRepository,
-} from './ports/giveaway-lifecycle-repository.js';
-import type { TelegramGateway } from './ports/telegram-gateway.js';
+import type { GiveawayLifecycleRepository } from './ports/giveaway-lifecycle-repository.js';
+
+type PostSynchronization = {
+  recoverInterrupted(): Promise<void>;
+  synchronizePending(): Promise<number>;
+  waitForIdle(): Promise<void>;
+};
 
 type CancellationDependencies = {
   createId: (kind: 'sync_task') => string;
@@ -16,16 +18,16 @@ const defaultDependencies: CancellationDependencies = {
 
 export class GiveawayCancellationService {
   readonly #repository: GiveawayLifecycleRepository;
-  readonly #gateway: TelegramGateway;
+  readonly #synchronization: PostSynchronization;
   readonly #dependencies: CancellationDependencies;
 
   constructor(
     repository: GiveawayLifecycleRepository,
-    gateway: TelegramGateway,
+    synchronization: PostSynchronization,
     dependencies: Partial<CancellationDependencies> = {},
   ) {
     this.#repository = repository;
-    this.#gateway = gateway;
+    this.#synchronization = synchronization;
     this.#dependencies = { ...defaultDependencies, ...dependencies };
   }
 
@@ -43,7 +45,7 @@ export class GiveawayCancellationService {
       ),
       now: this.#dependencies.now(),
     });
-    await this.#processTasks(prepared.tasks);
+    await this.#synchronization.synchronizePending();
     const pending = await this.#repository.listPendingCancellationSyncTasks();
     return {
       kind: prepared.kind,
@@ -53,30 +55,14 @@ export class GiveawayCancellationService {
   }
 
   async retryPendingSynchronization(): Promise<number> {
-    const tasks = await this.#repository.listPendingCancellationSyncTasks();
-    await this.#processTasks(tasks);
-    return tasks.length;
+    return this.#synchronization.synchronizePending();
   }
 
-  async #processTasks(tasks: CancellationSyncTask[]): Promise<void> {
-    for (const task of tasks) {
-      try {
-        await this.#gateway.editCancelledMessage({
-          chatId: task.chatId,
-          messageId: task.messageId,
-          kind: task.messageKind,
-          text: task.text,
-        });
-        await this.#repository.completeCancellationSyncTask(
-          task.id,
-          this.#dependencies.now(),
-        );
-      } catch {
-        await this.#repository.failCancellationSyncTask(
-          task.id,
-          this.#dependencies.now(),
-        );
-      }
-    }
+  async recoverInterrupted(): Promise<void> {
+    await this.#synchronization.recoverInterrupted();
+  }
+
+  async waitForIdle(): Promise<void> {
+    await this.#synchronization.waitForIdle();
   }
 }

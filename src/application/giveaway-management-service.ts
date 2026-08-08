@@ -1,4 +1,3 @@
-import { hashToken } from '../domain/tokens.js';
 import type { GiveawayManagementRepository } from './ports/giveaway-management-repository.js';
 
 type ManagementDependencies = { now: () => number };
@@ -21,18 +20,6 @@ export class GiveawayManagementService {
 
   getGiveawaySummary(giveawayId: string) {
     return this.#repository.getGiveawaySummary(giveawayId);
-  }
-
-  async resolveJoinLink(token: string) {
-    const target = await this.#repository.findJoinLinkTarget(hashToken(token));
-    if (
-      !target ||
-      target.tokenState !== 'active' ||
-      target.giveawayState !== 'active'
-    ) {
-      return { kind: 'unavailable' as const };
-    }
-    return { kind: 'epic_2_boundary' as const, giveaway: target };
   }
 
   listCancellationTargets(administratorTelegramId: number) {

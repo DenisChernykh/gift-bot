@@ -12,18 +12,19 @@ export type GiveawayListItem = {
   title: string;
   state: string;
   updatedAt: number;
+  participantCount: number;
+  referralsEnabled: boolean;
+  synchronizationState: 'up_to_date' | 'pending' | 'processing';
+  warnings: Array<{
+    channelId: string;
+    username: string;
+    title: string;
+  }>;
   failure?: {
     stage: string;
     errorKind: string;
     channels: FailedPublicationChannel[];
   };
-};
-
-export type JoinLinkTarget = {
-  id: string;
-  title: string;
-  giveawayState: string;
-  tokenState: string;
 };
 
 export type CancellationTarget =
@@ -38,7 +39,6 @@ export type CancellationTarget =
 export interface GiveawayManagementRepository {
   listGiveaways(administratorTelegramId: number): Promise<GiveawayListItem[]>;
   getGiveawaySummary(giveawayId: string): Promise<PublicationGiveaway>;
-  findJoinLinkTarget(tokenHash: string): Promise<JoinLinkTarget | null>;
   listCancellationTargets(
     administratorTelegramId: number,
   ): Promise<CancellationTarget[]>;

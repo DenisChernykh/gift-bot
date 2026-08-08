@@ -51,10 +51,60 @@ describe('SQLite bootstrap', () => {
           'publication_runs',
           'publication_deliveries',
           'sync_tasks',
+          'participants',
+          'referral_tokens',
+          'channel_health_alerts',
         ]),
       );
+      expect(
+        (await opened.database.all<{ name: string }>('PRAGMA table_info(sync_tasks)')).map(
+          (column) => column.name,
+        ),
+      ).toEqual(expect.arrayContaining(['available_at', 'last_error_kind']));
     } finally {
       await close?.();
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it('enforces one participant identity per giveaway and a same-giveaway inviter', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gift-bot-participants-'));
+    const opened = openDatabase(join(directory, 'gift-bot.sqlite'));
+
+    try {
+      await migrateDatabase(opened.database);
+      await opened.database.execute(
+        `insert into giveaways (
+           id, title, state, winner_count, deadline_utc, referrals_enabled,
+           content_kind, content_text, created_by_telegram_id, created_at, updated_at
+         ) values ('giveaway-1', 'One', 'active', 1, 1000, 1, 'text', 'One', 7, 0, 0),
+                  ('giveaway-2', 'Two', 'active', 1, 1000, 1, 'text', 'Two', 7, 0, 0)`,
+      );
+      await opened.database.execute(
+        `insert into participants (
+           id, giveaway_id, telegram_user_id, username, display_name,
+           inviter_participant_id, joined_at, updated_at
+         ) values ('participant-1', 'giveaway-1', 100, null, 'First', null, 10, 10)`,
+      );
+
+      await expect(
+        opened.database.execute(
+          `insert into participants (
+             id, giveaway_id, telegram_user_id, username, display_name,
+             inviter_participant_id, joined_at, updated_at
+           ) values ('participant-duplicate', 'giveaway-1', 100, null, 'Again', null, 11, 11)`,
+        ),
+      ).rejects.toThrow();
+      await expect(
+        opened.database.execute(
+          `insert into participants (
+             id, giveaway_id, telegram_user_id, username, display_name,
+             inviter_participant_id, joined_at, updated_at
+           ) values ('participant-cross', 'giveaway-2', 200, null, 'Cross', 'participant-1', 12, 12)`,
+        ),
+      ).rejects.toThrow();
+    } finally {
+      await opened.close();
       rmSync(directory, { force: true, recursive: true });
     }
   });
@@ -308,6 +358,94 @@ describe('migration command wiring', () => {
       ).toEqual([{ failure_run_id: 'current-run' }]);
     } finally {
       await close?.();
+      rmSync(directory, { force: true, recursive: true });
+    }
+  });
+
+  it('upgrades a populated 0005 database to Epic 2, reapplies idempotently, and remains integral', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gift-bot-0005-upgrade-'));
+    const databasePath = join(directory, 'gift-bot.sqlite');
+    const migrationsDirectory = fileURLToPath(
+      new URL('../../drizzle/', import.meta.url),
+    );
+    const journal = JSON.parse(
+      readFileSync(join(migrationsDirectory, 'meta/_journal.json'), 'utf8'),
+    ) as {
+      entries: Array<{ idx: number; when: number; tag: string }>;
+    };
+    const opened = openDatabase(databasePath);
+
+    try {
+      for (const entry of journal.entries.filter((item) => item.idx <= 5)) {
+        const migration = readFileSync(
+          join(migrationsDirectory, `${entry.tag}.sql`),
+          'utf8',
+        );
+        for (const statement of migration
+          .split('--> statement-breakpoint')
+          .map((value) => value.trim())
+          .filter(Boolean)) {
+          await opened.database.execute(statement);
+        }
+      }
+      await opened.database.execute(
+        `create table __drizzle_migrations (
+           id integer primary key, hash text not null, created_at numeric
+         )`,
+      );
+      const migration0005 = journal.entries.find((entry) => entry.idx === 5)!;
+      await opened.database.execute(
+        `insert into __drizzle_migrations (hash, created_at)
+         values ('0005-fixture', ?)`,
+        [migration0005.when],
+      );
+      await opened.database.execute(
+        `insert into giveaways (
+           id, title, state, winner_count, deadline_utc, referrals_enabled,
+           content_kind, content_text, created_by_telegram_id, created_at, updated_at
+         ) values ('upgrade-giveaway', 'Upgrade', 'active', 1, 1000, 0,
+                   'text', 'Conditions', 700, 1, 1)`,
+      );
+      await opened.database.execute(
+        `insert into giveaway_channels (
+           id, giveaway_id, telegram_chat_id, username, title,
+           owner_telegram_id, status, created_at, updated_at
+         ) values ('upgrade-channel', 'upgrade-giveaway', -1001,
+                   'upgrade_channel', 'Upgrade channel', 700,
+                   'confirmed', 1, 1)`,
+      );
+      await opened.database.execute(
+        `insert into sync_tasks (
+           id, giveaway_id, giveaway_channel_id, task_type, payload,
+           status, attempts, created_at, updated_at
+         ) values ('legacy-task', 'upgrade-giveaway', 'upgrade-channel',
+                   'cancel_message', '{}', 'completed', 1, 1, 1)`,
+      );
+
+      await migrateDatabase(opened.database);
+      await migrateDatabase(opened.database);
+
+      expect(
+        await opened.database.all(
+          `select available_at, last_error_kind
+             from sync_tasks where id = 'legacy-task'`,
+        ),
+      ).toEqual([{ available_at: 0, last_error_kind: null }]);
+      expect(
+        await opened.database.all(
+          "select name from sqlite_master where type = 'table' and name in ('participants', 'referral_tokens', 'channel_health_alerts') order by name",
+        ),
+      ).toEqual([
+        { name: 'channel_health_alerts' },
+        { name: 'participants' },
+        { name: 'referral_tokens' },
+      ]);
+      expect(await opened.database.all('PRAGMA integrity_check')).toEqual([
+        { integrity_check: 'ok' },
+      ]);
+      expect(await opened.database.all('PRAGMA foreign_key_check')).toEqual([]);
+    } finally {
+      await opened.close();
       rmSync(directory, { force: true, recursive: true });
     }
   });
