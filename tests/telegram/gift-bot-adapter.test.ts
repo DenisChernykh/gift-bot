@@ -388,6 +388,7 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
       'внутреннее название',
     );
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain('100');
     await bot.handleUpdate(privateMessageUpdate(updateId++, 700, 'Августовский подарок'));
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
       'число победителей',

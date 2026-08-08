@@ -181,6 +181,26 @@ describe('GiveawayPublicationService', () => {
     expect(await database.all('select id from publication_runs')).toEqual([]);
   });
 
+  it('rejects a stored final render overflow without persisting publication state', async () => {
+    const { database, gateway, service } = await openPublicationApplication(1);
+    await database.execute(
+      "update giveaways set content_text = ? where id = 'giveaway-1'",
+      ['a'.repeat(4096)],
+    );
+
+    await expect(service.publish('giveaway-1')).rejects.toThrow(
+      'Final giveaway message exceeds the Telegram length limit',
+    );
+
+    expect(gateway.sent).toEqual([]);
+    expect(await database.all('select state from giveaways')).toEqual([
+      { state: 'draft' },
+    ]);
+    expect(await database.all('select id from publication_runs')).toEqual([]);
+    expect(await database.all('select token_hash from join_tokens')).toEqual([]);
+    expect(await database.all('select id from publication_deliveries')).toEqual([]);
+  });
+
   it('rolls known messages back in reverse order after a definite send failure', async () => {
     const { database, gateway, service } = await openPublicationApplication(3);
     gateway.sendResults = [601, 602, new TelegramDeliveryError('forbidden', 'definite')];

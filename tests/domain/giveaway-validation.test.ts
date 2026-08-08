@@ -8,10 +8,11 @@ import {
 } from '../../src/domain/giveaway-validation.js';
 
 describe('giveaway field validation', () => {
-  it('normalizes a non-empty title within the supported length', () => {
+  it('accepts an internal title of 100 characters and rejects 101', () => {
     expect(validateGiveawayTitle('  August giveaway  ')).toBe('August giveaway');
+    expect(validateGiveawayTitle('a'.repeat(100))).toHaveLength(100);
     expect(() => validateGiveawayTitle('   ')).toThrow();
-    expect(() => validateGiveawayTitle('a'.repeat(129))).toThrow();
+    expect(() => validateGiveawayTitle('a'.repeat(101))).toThrow();
   });
 
   it('accepts only integer winner counts from one through fifty', () => {

@@ -1,7 +1,7 @@
 import { fromZonedTime } from 'date-fns-tz';
 import type { MessageEntity } from 'grammy/types';
 
-const MAX_TITLE_LENGTH = 128;
+const MAX_TITLE_LENGTH = 100;
 const MAX_TEXT_LENGTH = 4096;
 const MAX_CAPTION_LENGTH = 1024;
 const PRODUCT_TIME_ZONE = 'Asia/Yekaterinburg';
@@ -20,7 +20,7 @@ export type GiveawayMessageEntity = MessageEntity;
 export function validateGiveawayTitle(value: string): string {
   const title = value.trim();
   if (title.length === 0 || title.length > MAX_TITLE_LENGTH) {
-    throw new Error('Giveaway title must be from 1 to 128 characters');
+    throw new Error('Giveaway title must be from 1 to 100 characters');
   }
 
   return title;

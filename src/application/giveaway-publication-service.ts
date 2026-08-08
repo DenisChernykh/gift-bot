@@ -83,6 +83,7 @@ export class GiveawayPublicationService {
       giveawayChannelId: channel.id,
     }));
     const joinToken = this.#dependencies.createToken();
+    const message = this.#renderMessage(giveaway, joinToken.token);
     const begin = await this.#repository.beginPublication({
       giveawayId,
       publicationRunId,
@@ -101,7 +102,6 @@ export class GiveawayPublicationService {
       deliveries.map((delivery) => [delivery.giveawayChannelId, delivery]),
     );
     const knownDeliveries: PublicationDelivery[] = [];
-    const message = this.#renderMessage(giveaway, joinToken.token);
 
     for (const channel of giveaway.channels) {
       const delivery = deliveryByChannelId.get(channel.id);

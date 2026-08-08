@@ -430,7 +430,7 @@ async function replyWizardPrompt(
 ) {
   switch (wizard.step) {
     case 'title':
-      await context.reply('Введите внутреннее название розыгрыша (до 128 символов).');
+      await context.reply('Введите внутреннее название розыгрыша (до 100 символов).');
       return;
     case 'winner_count':
       await context.reply('Введите число победителей от 1 до 50.');
