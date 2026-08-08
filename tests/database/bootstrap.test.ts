@@ -106,6 +106,25 @@ describe('database boundary', () => {
     }
   });
 
+  it('does not expose a raw SQLite handle on the serialized database object', async () => {
+    const opened = openDatabase(':memory:');
+    const runtimeSurface = opened.database as unknown as Record<string, unknown>;
+
+    try {
+      expect('sqlite' in runtimeSurface).toBe(false);
+      expect(
+        Object.values(runtimeSurface).some(
+          (value) =>
+            typeof value === 'object' &&
+            value !== null &&
+            ('prepare' in value || 'exec' in value),
+        ),
+      ).toBe(false);
+    } finally {
+      await opened.close();
+    }
+  });
+
   it('waits to close until an active transaction releases database ownership', async () => {
     const opened = openDatabase(':memory:');
     const transactionReachedWait = Promise.withResolvers<void>();

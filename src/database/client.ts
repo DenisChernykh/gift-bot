@@ -8,16 +8,19 @@ import * as schema from './schema.js';
 type DatabaseRow = Record<string, unknown>;
 
 export class DatabaseBoundary {
-  private readonly transactionContext = new AsyncLocalStorage<DatabaseBoundary>();
-  private locked = false;
-  private closed = false;
-  private readonly waiters: Array<() => void> = [];
+  readonly #transactionContext = new AsyncLocalStorage<DatabaseBoundary>();
+  #locked = false;
+  #closed = false;
+  readonly #waiters: Array<() => void> = [];
+  readonly #sqlite: DatabaseSync;
 
-  constructor(private readonly sqlite: DatabaseSync) {}
+  constructor(sqlite: DatabaseSync) {
+    this.#sqlite = sqlite;
+  }
 
   async execute(sql: string, parameters: SQLInputValue[] = []): Promise<void> {
     await this.exclusively(() => {
-      this.sqlite.prepare(sql).run(...parameters);
+      this.#sqlite.prepare(sql).run(...parameters);
     });
   }
 
@@ -26,7 +29,7 @@ export class DatabaseBoundary {
     parameters: SQLInputValue[] = [],
   ): Promise<Row[]> {
     return this.exclusively(() =>
-      this.sqlite.prepare(sql).all(...parameters) as Row[],
+      this.#sqlite.prepare(sql).all(...parameters) as Row[],
     );
   }
 
@@ -35,7 +38,7 @@ export class DatabaseBoundary {
     parameters: SQLInputValue[] = [],
   ): Promise<unknown[][]> {
     return this.exclusively(() => {
-      const statement = this.sqlite.prepare(sql);
+      const statement = this.#sqlite.prepare(sql);
       statement.setReturnArrays(true);
       return statement.all(...parameters) as unknown as unknown[][];
     });
@@ -48,14 +51,14 @@ export class DatabaseBoundary {
 
     try {
       this.assertOpen();
-      this.sqlite.exec('BEGIN');
-      return await this.transactionContext.run(this, async () => {
+      this.#sqlite.exec('BEGIN');
+      return await this.#transactionContext.run(this, async () => {
         try {
           const result = await operation(this);
-          this.sqlite.exec('COMMIT');
+          this.#sqlite.exec('COMMIT');
           return result;
         } catch (error) {
-          this.sqlite.exec('ROLLBACK');
+          this.#sqlite.exec('ROLLBACK');
           throw error;
         }
       });
@@ -65,15 +68,15 @@ export class DatabaseBoundary {
   }
 
   async close(): Promise<void> {
-    if (this.transactionContext.getStore() === this) {
+    if (this.#transactionContext.getStore() === this) {
       throw new Error('Cannot close the database from an active transaction');
     }
 
     const release = await this.acquire();
     try {
-      if (!this.closed) {
-        this.sqlite.close();
-        this.closed = true;
+      if (!this.#closed) {
+        this.#sqlite.close();
+        this.#closed = true;
       }
     } finally {
       release();
@@ -81,7 +84,7 @@ export class DatabaseBoundary {
   }
 
   private async exclusively<Result>(operation: () => Result): Promise<Result> {
-    if (this.transactionContext.getStore() === this) {
+    if (this.#transactionContext.getStore() === this) {
       this.assertOpen();
       return operation();
     }
@@ -96,27 +99,27 @@ export class DatabaseBoundary {
   }
 
   private async acquire(): Promise<() => void> {
-    if (!this.locked) {
-      this.locked = true;
+    if (!this.#locked) {
+      this.#locked = true;
       return () => this.release();
     }
 
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve) => this.#waiters.push(resolve));
     return () => this.release();
   }
 
   private release(): void {
-    const next = this.waiters.shift();
+    const next = this.#waiters.shift();
     if (next) {
       next();
       return;
     }
 
-    this.locked = false;
+    this.#locked = false;
   }
 
   private assertOpen(): void {
-    if (this.closed) {
+    if (this.#closed) {
       throw new Error('Database is closed');
     }
   }
