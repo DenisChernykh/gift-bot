@@ -125,6 +125,56 @@ describe('database boundary', () => {
     }
   });
 
+  it('keeps transaction ownership helpers off the runtime prototype', async () => {
+    const { database, close } = openDatabase(':memory:');
+    const runtimePrototype = Object.getPrototypeOf(database) as Record<
+      string,
+      unknown
+    >;
+    const sensitiveHelpers = ['exclusively', 'acquire', 'release', 'assertOpen'];
+    const transactionReachedWait = Promise.withResolvers<void>();
+    const releaseWait = Promise.withResolvers<void>();
+    let failedTransaction: Promise<void> | undefined;
+    let outsideWrite: Promise<void> | undefined;
+
+    try {
+      await database.execute('create table entries (value text not null)');
+
+      const exposedRelease = runtimePrototype.release;
+      if (typeof exposedRelease === 'function') {
+        failedTransaction = database.transaction(async (transaction) => {
+          await transaction.execute("insert into entries (value) values ('inside')");
+          transactionReachedWait.resolve();
+          await releaseWait.promise;
+          throw new Error('rollback');
+        });
+
+        await transactionReachedWait.promise;
+        exposedRelease.call(database);
+        outsideWrite = database.execute(
+          "insert into entries (value) values ('outside')",
+        );
+        await outsideWrite;
+        releaseWait.resolve();
+
+        await expect(failedTransaction).rejects.toThrow('rollback');
+        expect(
+          await database.all<{ value: string }>('select value from entries'),
+        ).toEqual([{ value: 'outside' }]);
+      }
+
+      expect(
+        sensitiveHelpers.filter(
+          (helper) => typeof runtimePrototype[helper] === 'function',
+        ),
+      ).toEqual([]);
+    } finally {
+      releaseWait.resolve();
+      await Promise.allSettled([failedTransaction, outsideWrite].filter(Boolean));
+      await close();
+    }
+  });
+
   it('waits to close until an active transaction releases database ownership', async () => {
     const opened = openDatabase(':memory:');
     const transactionReachedWait = Promise.withResolvers<void>();

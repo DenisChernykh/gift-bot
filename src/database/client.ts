@@ -19,7 +19,7 @@ export class DatabaseBoundary {
   }
 
   async execute(sql: string, parameters: SQLInputValue[] = []): Promise<void> {
-    await this.exclusively(() => {
+    await this.#exclusively(() => {
       this.#sqlite.prepare(sql).run(...parameters);
     });
   }
@@ -28,7 +28,7 @@ export class DatabaseBoundary {
     sql: string,
     parameters: SQLInputValue[] = [],
   ): Promise<Row[]> {
-    return this.exclusively(() =>
+    return this.#exclusively(() =>
       this.#sqlite.prepare(sql).all(...parameters) as Row[],
     );
   }
@@ -37,7 +37,7 @@ export class DatabaseBoundary {
     sql: string,
     parameters: SQLInputValue[] = [],
   ): Promise<unknown[][]> {
-    return this.exclusively(() => {
+    return this.#exclusively(() => {
       const statement = this.#sqlite.prepare(sql);
       statement.setReturnArrays(true);
       return statement.all(...parameters) as unknown as unknown[][];
@@ -47,10 +47,10 @@ export class DatabaseBoundary {
   async transaction<Result>(
     operation: (transaction: DatabaseBoundary) => Promise<Result>,
   ): Promise<Result> {
-    const release = await this.acquire();
+    const release = await this.#acquire();
 
     try {
-      this.assertOpen();
+      this.#assertOpen();
       this.#sqlite.exec('BEGIN');
       return await this.#transactionContext.run(this, async () => {
         try {
@@ -72,7 +72,7 @@ export class DatabaseBoundary {
       throw new Error('Cannot close the database from an active transaction');
     }
 
-    const release = await this.acquire();
+    const release = await this.#acquire();
     try {
       if (!this.#closed) {
         this.#sqlite.close();
@@ -83,32 +83,32 @@ export class DatabaseBoundary {
     }
   }
 
-  private async exclusively<Result>(operation: () => Result): Promise<Result> {
+  async #exclusively<Result>(operation: () => Result): Promise<Result> {
     if (this.#transactionContext.getStore() === this) {
-      this.assertOpen();
+      this.#assertOpen();
       return operation();
     }
 
-    const release = await this.acquire();
+    const release = await this.#acquire();
     try {
-      this.assertOpen();
+      this.#assertOpen();
       return operation();
     } finally {
       release();
     }
   }
 
-  private async acquire(): Promise<() => void> {
+  async #acquire(): Promise<() => void> {
     if (!this.#locked) {
       this.#locked = true;
-      return () => this.release();
+      return () => this.#release();
     }
 
     await new Promise<void>((resolve) => this.#waiters.push(resolve));
-    return () => this.release();
+    return () => this.#release();
   }
 
-  private release(): void {
+  #release(): void {
     const next = this.#waiters.shift();
     if (next) {
       next();
@@ -118,7 +118,7 @@ export class DatabaseBoundary {
     this.#locked = false;
   }
 
-  private assertOpen(): void {
+  #assertOpen(): void {
     if (this.#closed) {
       throw new Error('Database is closed');
     }
