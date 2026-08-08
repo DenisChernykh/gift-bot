@@ -15,11 +15,11 @@ export interface PostSynchronizationRepository {
   completeTask(input: {
     id: string;
     expectedPayload: string;
+    availableAt: number;
     now: number;
   }): Promise<void>;
   failTask(input: {
     id: string;
-    expectedPayload: string;
     errorKind: string;
     availableAt: number;
     now: number;

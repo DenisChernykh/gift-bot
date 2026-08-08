@@ -520,4 +520,32 @@ describe('referral registration', () => {
       ),
     ).toEqual([]);
   });
+
+  it('does not issue a new referral token after the giveaway closes', async () => {
+    const { database, gateway, repository, service } = await openApplication({
+      referralsEnabled: true,
+    });
+    gateway.participantMemberships.set(800, { status: 'member' });
+    const participant = await service.joinWithToken({
+      kind: 'join',
+      token: 'join-token',
+      user: { telegramUserId: 800, username: 'one', displayName: 'One' },
+    });
+    if (participant.kind !== 'registered') throw new Error('Missing participant');
+    await database.execute(
+      "update giveaways set state = 'cancelled' where id = 'giveaway-1'",
+    );
+
+    await expect(
+      repository.storeReferralToken({
+        tokenHash: hashToken('late-referral'),
+        giveawayId: 'giveaway-1',
+        inviterParticipantId: participant.participantId,
+        now: NOW + 1,
+      }),
+    ).resolves.toBe(false);
+    expect(
+      await database.all('select count(*) as count from referral_tokens'),
+    ).toEqual([{ count: 1 }]);
+  });
 });

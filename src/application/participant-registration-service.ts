@@ -196,16 +196,18 @@ export class ParticipantRegistrationService {
     let referral: { token: string; url: string } | undefined;
     if (target.referralsEnabled) {
       const stored = this.#dependencies.createToken();
-      await this.#repository.storeReferralToken({
+      const persisted = await this.#repository.storeReferralToken({
         tokenHash: stored.tokenHash,
         giveawayId: target.giveawayId,
         inviterParticipantId: participant.id,
         now: this.#dependencies.now(),
       });
-      referral = {
-        token: stored.token,
-        url: `https://t.me/${this.#dependencies.botUsername}?start=ref_${stored.token}`,
-      };
+      if (persisted) {
+        referral = {
+          token: stored.token,
+          url: `https://t.me/${this.#dependencies.botUsername}?start=ref_${stored.token}`,
+        };
+      }
     }
     return {
       kind: 'registered',

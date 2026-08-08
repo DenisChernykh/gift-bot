@@ -1372,12 +1372,15 @@ export class SqliteGiveawayCreationRepository
         contentKind: 'text' | 'photo';
         contentText: string;
         failureRunId: string | null;
+        participantCount: number;
       }>(
         `select title, state, winner_count as winnerCount,
                 deadline_utc as deadlineUtc,
                 referrals_enabled as referralsEnabled,
                 content_kind as contentKind, content_text as contentText,
-                failure_run_id as failureRunId
+                failure_run_id as failureRunId,
+                (select count(*) from participants p
+                  where p.giveaway_id = giveaways.id) as participantCount
            from giveaways where id = ?`,
         [input.giveawayId],
       );
@@ -1460,13 +1463,16 @@ export class SqliteGiveawayCreationRepository
         giveaway.contentKind === 'text'
           ? ({ kind: 'text', text: giveaway.contentText } as const)
           : ({ kind: 'photo', caption: giveaway.contentText } as const);
-      const rendered = renderGiveawayMessage({
-        title: giveaway.title,
-        winnerCount: giveaway.winnerCount,
-        deadlineUtc: giveaway.deadlineUtc,
-        referralsEnabled: giveaway.referralsEnabled === 1,
-        content,
-      });
+      const rendered = renderGiveawayMessage(
+        {
+          title: giveaway.title,
+          winnerCount: giveaway.winnerCount,
+          deadlineUtc: giveaway.deadlineUtc,
+          referralsEnabled: giveaway.referralsEnabled === 1,
+          content,
+        },
+        giveaway.participantCount,
+      );
       const cancelledText = renderCancelledGiveawayMessage(
         rendered.text,
         rendered.kind,

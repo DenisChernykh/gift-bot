@@ -466,6 +466,12 @@ describe('GiveawayCancellationService', () => {
     expect(await database.all('select state from referral_tokens')).toEqual([
       { state: 'revoked' },
     ]);
+    const [{ payload }] = await database.all<{ payload: string }>(
+      "select payload from sync_tasks where task_type = 'cancel_message'",
+    );
+    expect((JSON.parse(payload) as { text: string }).text).toContain(
+      'Зарегистрировано участников: 1',
+    );
   });
 
   it('retries durable cancellation sync tasks during startup processing', async () => {

@@ -74,10 +74,15 @@ export class GiveawayPostSynchronizationService {
       }
       try {
         await this.#gateway.editGiveawayPost(edit);
+        const completedAt = this.#dependencies.now();
         await this.#repository.completeTask({
           id: task.id,
           expectedPayload: task.payload,
-          now: this.#dependencies.now(),
+          availableAt:
+            task.taskType === 'participant_count'
+              ? completedAt + this.#dependencies.retryIntervalMs
+              : completedAt,
+          now: completedAt,
         });
       } catch (error) {
         const classified = classifySynchronizationError(error);
@@ -90,7 +95,6 @@ export class GiveawayPostSynchronizationService {
         const failedAt = this.#dependencies.now();
         await this.#repository.failTask({
           id: task.id,
-          expectedPayload: task.payload,
           errorKind: classified.errorKind,
           availableAt: failedAt + delay,
           now: failedAt,

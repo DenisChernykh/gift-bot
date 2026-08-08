@@ -59,7 +59,7 @@ export interface ParticipantRepository {
     giveawayId: string;
     inviterParticipantId: string;
     now: number;
-  }): Promise<void>;
+  }): Promise<boolean>;
   recordBotRightsLoss(input: {
     giveawayId: string;
     giveawayChannelId: string;

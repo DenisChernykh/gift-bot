@@ -148,20 +148,35 @@ export class SqlitePostSynchronizationRepository
   async completeTask(input: {
     id: string;
     expectedPayload: string;
+    availableAt: number;
     now: number;
   }): Promise<void> {
     await this.#database.execute(
       `update sync_tasks
-          set status = 'completed', attempts = attempts + 1,
+          set status = case
+                when payload = ? then 'completed'
+                else 'pending'
+              end,
+              attempts = attempts + 1,
+              available_at = case
+                when task_type = 'participant_count' and payload <> ?
+                  then max(available_at, ?)
+                else available_at
+              end,
               last_error_kind = null, updated_at = ?
-        where id = ? and status = 'processing' and payload = ?`,
-      [input.now, input.id, input.expectedPayload],
+        where id = ? and status in ('processing', 'pending')`,
+      [
+        input.expectedPayload,
+        input.expectedPayload,
+        input.availableAt,
+        input.now,
+        input.id,
+      ],
     );
   }
 
   async failTask(input: {
     id: string;
-    expectedPayload: string;
     errorKind: string;
     availableAt: number;
     now: number;
@@ -169,14 +184,14 @@ export class SqlitePostSynchronizationRepository
     await this.#database.execute(
       `update sync_tasks
           set status = 'pending', attempts = attempts + 1,
-              available_at = ?, last_error_kind = ?, updated_at = ?
-        where id = ? and status = 'processing' and payload = ?`,
+              available_at = max(available_at, ?),
+              last_error_kind = ?, updated_at = ?
+        where id = ? and status in ('processing', 'pending')`,
       [
         input.availableAt,
         input.errorKind,
         input.now,
         input.id,
-        input.expectedPayload,
       ],
     );
   }

@@ -9,6 +9,7 @@ import type { TelegramPostEdit } from '../../src/application/ports/telegram-gate
 import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
 import { openDatabase } from '../../src/database/client.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
+import { SqliteParticipantRepository } from '../../src/database/participant-repository.js';
 import { SqlitePostSynchronizationRepository } from '../../src/database/post-synchronization-repository.js';
 
 const NOW = Date.UTC(2026, 7, 9, 9, 0);
@@ -96,10 +97,19 @@ async function openSynchronization() {
   );
   const gateway = new FakeEditGateway();
   const repository = new SqlitePostSynchronizationRepository(opened.database);
+  let currentNow = NOW;
   const service = new GiveawayPostSynchronizationService(repository, gateway, {
-    now: () => NOW,
+    now: () => currentNow,
   });
-  return { ...opened, gateway, repository, service };
+  return {
+    ...opened,
+    gateway,
+    repository,
+    service,
+    advanceTime: (milliseconds: number) => {
+      currentNow += milliseconds;
+    },
+  };
 }
 
 describe('giveaway post synchronization', () => {
@@ -245,5 +255,112 @@ describe('giveaway post synchronization', () => {
         removeParticipationButton: false,
       }),
     ]);
+  });
+
+  it('keeps a coalesced registration during processing throttled from the completed edit', async () => {
+    const { database, gateway, service, advanceTime } =
+      await openSynchronization();
+    const editStarted = Promise.withResolvers<void>();
+    const releaseEdit = Promise.withResolvers<void>();
+    gateway.beforeEdit = async () => {
+      gateway.beforeEdit = undefined;
+      editStarted.resolve();
+      await releaseEdit.promise;
+    };
+
+    const firstPass = service.synchronizePending();
+    await editStarted.promise;
+    advanceTime(10_000);
+    const participants = new SqliteParticipantRepository(database, {
+      createId: (kind) => `${kind}-during-edit`,
+    });
+    await participants.registerParticipant({
+      giveawayId: 'giveaway-1',
+      telegramUserId: 901,
+      username: null,
+      displayName: 'Second participant',
+      inviterParticipantId: null,
+      now: NOW + 10_000,
+    });
+    const queuedPass = service.synchronizePending();
+    releaseEdit.resolve();
+
+    expect(await firstPass).toBe(1);
+    expect(await queuedPass).toBe(0);
+    expect(gateway.edits).toHaveLength(1);
+    expect(
+      await database.all(
+        `select status, payload, attempts, available_at
+           from sync_tasks where id = 'counter-1'`,
+      ),
+    ).toEqual([
+      {
+        status: 'pending',
+        payload: '{"targetCount":2}',
+        attempts: 1,
+        available_at: NOW + 70_000,
+      },
+    ]);
+
+    advanceTime(60_000);
+    expect(await service.synchronizePending()).toBe(1);
+    expect(gateway.edits).toHaveLength(2);
+    expect(gateway.edits[1]!.text).toContain(
+      'Зарегистрировано участников: 2',
+    );
+  });
+
+  it('retains coalesced work when the in-flight edit fails', async () => {
+    const { database, gateway, service, advanceTime } =
+      await openSynchronization();
+    const editStarted = Promise.withResolvers<void>();
+    const releaseEdit = Promise.withResolvers<void>();
+    gateway.beforeEdit = async () => {
+      gateway.beforeEdit = undefined;
+      editStarted.resolve();
+      await releaseEdit.promise;
+    };
+    gateway.failures.push(
+      new TelegramDeliveryError('Too many requests', 'definite', 90_000),
+    );
+
+    const firstPass = service.synchronizePending();
+    await editStarted.promise;
+    advanceTime(10_000);
+    const participants = new SqliteParticipantRepository(database, {
+      createId: (kind) => `${kind}-during-failure`,
+    });
+    await participants.registerParticipant({
+      giveawayId: 'giveaway-1',
+      telegramUserId: 902,
+      username: null,
+      displayName: 'Second participant',
+      inviterParticipantId: null,
+      now: NOW + 10_000,
+    });
+    releaseEdit.resolve();
+
+    expect(await firstPass).toBe(1);
+    expect(
+      await database.all(
+        `select status, payload, attempts, available_at, last_error_kind
+           from sync_tasks where id = 'counter-1'`,
+      ),
+    ).toEqual([
+      {
+        status: 'pending',
+        payload: '{"targetCount":2}',
+        attempts: 1,
+        available_at: NOW + 100_000,
+        last_error_kind: 'telegram_definite',
+      },
+    ]);
+
+    expect(await service.synchronizePending()).toBe(0);
+    advanceTime(90_000);
+    expect(await service.synchronizePending()).toBe(1);
+    expect(gateway.edits.at(-1)!.text).toContain(
+      'Зарегистрировано участников: 2',
+    );
   });
 });

@@ -254,18 +254,36 @@ export class SqliteParticipantRepository
     giveawayId: string;
     inviterParticipantId: string;
     now: number;
-  }): Promise<void> {
-    await this.#database.execute(
-      `insert into referral_tokens (
-         token_hash, giveaway_id, inviter_participant_id, state, created_at
-       ) values (?, ?, ?, 'active', ?)`,
-      [
-        input.tokenHash,
-        input.giveawayId,
-        input.inviterParticipantId,
-        input.now,
-      ],
-    );
+  }): Promise<boolean> {
+    return this.#database.transaction(async (transaction) => {
+      const targets = await transaction.all<{ participantId: string }>(
+        `select p.id as participantId
+           from giveaways g
+           join participants p on p.giveaway_id = g.id and p.id = ?
+          where g.id = ? and g.state = 'active' and g.deadline_utc > ?
+            and g.referrals_enabled = 1 and p.joined_at <= ?`,
+        [
+          input.inviterParticipantId,
+          input.giveawayId,
+          input.now,
+          input.now,
+        ],
+      );
+      if (!targets[0]) return false;
+
+      await transaction.execute(
+        `insert into referral_tokens (
+           token_hash, giveaway_id, inviter_participant_id, state, created_at
+         ) values (?, ?, ?, 'active', ?)`,
+        [
+          input.tokenHash,
+          input.giveawayId,
+          input.inviterParticipantId,
+          input.now,
+        ],
+      );
+      return true;
+    });
   }
 
   async recordBotRightsLoss(input: {
