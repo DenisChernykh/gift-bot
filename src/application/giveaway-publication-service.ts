@@ -108,10 +108,13 @@ export class GiveawayPublicationService {
       if (!delivery) throw new Error('Missing publication delivery intent');
 
       try {
-        const sent = await this.#sendWithRateLimitRetry({
-          ...message,
-          chatId: channel.telegramChatId,
-        });
+        const sent = await this.#sendWithRateLimitRetry(
+          {
+            ...message,
+            chatId: channel.telegramChatId,
+          },
+          delivery.id,
+        );
         await this.#repository.savePublicationDelivery({
           deliveryId: delivery.id,
           messageId: sent.messageId,
@@ -154,9 +157,16 @@ export class GiveawayPublicationService {
     return { kind: 'active', giveawayId };
   }
 
-  async #sendWithRateLimitRetry(input: TelegramGiveawayMessage) {
+  async #sendWithRateLimitRetry(
+    input: TelegramGiveawayMessage,
+    deliveryId: string,
+  ) {
     for (let attempt = 0; ; attempt += 1) {
       try {
+        await this.#repository.markPublicationDeliverySending(
+          deliveryId,
+          this.#dependencies.now(),
+        );
         return await this.#gateway.sendGiveawayMessage(input);
       } catch (error) {
         if (

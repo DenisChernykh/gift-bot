@@ -33,7 +33,11 @@ export class GiveawayRecoveryService {
   }
 
   async #recover(publication: RecoverablePublication) {
-    if (publication.deliveries.some((delivery) => delivery.status === 'unknown')) {
+    if (
+      publication.deliveries.some((delivery) =>
+        ['sending', 'unknown'].includes(delivery.status),
+      )
+    ) {
       await this.#repository.failPublication(
         publication.runId,
         this.#dependencies.now(),

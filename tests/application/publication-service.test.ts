@@ -125,7 +125,7 @@ describe('GiveawayPublicationService', () => {
              order by giveaway_channel_id`,
         ),
       ).toEqual([
-        { status: 'pending', message_id: null },
+        { status: 'sending', message_id: null },
         { status: 'pending', message_id: null },
       ]);
       expect(

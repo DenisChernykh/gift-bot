@@ -33,6 +33,7 @@ import type {
   JoinLinkTarget,
 } from '../application/ports/giveaway-management-repository.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
+import { renderCancelledGiveawayMessage } from '../domain/giveaway-cancellation-rendering.js';
 
 type WizardRow = {
   id: string;
@@ -886,8 +887,20 @@ export class SqliteGiveawayCreationRepository
     await this.#database.execute(
       `update publication_deliveries
           set status = 'delivered', message_id = ?, message_kind = ?, updated_at = ?
-        where id = ? and status = 'pending'`,
+        where id = ? and status = 'sending'`,
       [input.messageId, input.messageKind, input.now, input.deliveryId],
+    );
+  }
+
+  async markPublicationDeliverySending(
+    deliveryId: string,
+    now: number,
+  ): Promise<void> {
+    await this.#database.execute(
+      `update publication_deliveries
+          set status = 'sending', updated_at = ?
+        where id = ? and status in ('pending', 'sending')`,
+      [now, deliveryId],
     );
   }
 
@@ -898,7 +911,7 @@ export class SqliteGiveawayCreationRepository
     await this.#database.execute(
       `update publication_deliveries
           set status = 'unknown', updated_at = ?
-        where id = ? and status = 'pending'`,
+        where id = ? and status in ('pending', 'sending')`,
       [now, deliveryId],
     );
   }
@@ -1129,13 +1142,17 @@ export class SqliteGiveawayCreationRepository
         giveaway.contentKind === 'text'
           ? ({ kind: 'text', text: giveaway.contentText } as const)
           : ({ kind: 'photo', caption: giveaway.contentText } as const);
-      const cancelledText = `${renderGiveawayMessage({
+      const rendered = renderGiveawayMessage({
         title: giveaway.title,
         winnerCount: giveaway.winnerCount,
         deadlineUtc: giveaway.deadlineUtc,
         referralsEnabled: giveaway.referralsEnabled === 1,
         content,
-      }).text}\n\nРозыгрыш отменён.`;
+      });
+      const cancelledText = renderCancelledGiveawayMessage(
+        rendered.text,
+        rendered.kind,
+      );
 
       for (const [index, delivery] of deliveries.entries()) {
         await transaction.execute(

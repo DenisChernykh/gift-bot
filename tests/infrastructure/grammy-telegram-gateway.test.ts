@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { GrammyError, HttpError } from 'grammy';
+import { GrammyError, HttpError, type Api } from 'grammy';
 
-import { classifyTelegramError } from '../../src/infrastructure/grammy-telegram-gateway.js';
+import {
+  classifyTelegramError,
+  GrammyTelegramGateway,
+} from '../../src/infrastructure/grammy-telegram-gateway.js';
+import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
 
 describe('classifyTelegramError', () => {
   it('classifies HTTP 429 as definitely not delivered and exposes retry_after', () => {
@@ -50,3 +54,55 @@ describe('classifyTelegramError', () => {
     expect(classifyTelegramError(networkError).outcome).toBe('unknown');
   });
 });
+
+describe('GrammyTelegramGateway cancellation edits', () => {
+  it('treats the exact message-is-not-modified response as idempotent success', async () => {
+    const api = {
+      editMessageText: async () => {
+        throw telegramEditError(
+          'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
+        );
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await expect(
+      gateway.editCancelledMessage({
+        chatId: -1001,
+        messageId: 42,
+        kind: 'text',
+        text: 'Розыгрыш отменён.',
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('keeps every other Telegram 400 edit response as a definite failure', async () => {
+    const api = {
+      editMessageText: async () => {
+        throw telegramEditError('Bad Request: message to edit not found');
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await expect(
+      gateway.editCancelledMessage({
+        chatId: -1001,
+        messageId: 42,
+        kind: 'text',
+        text: 'Розыгрыш отменён.',
+      }),
+    ).rejects.toMatchObject<TelegramDeliveryError>({
+      outcome: 'definite',
+      retryAfterMs: null,
+    });
+  });
+});
+
+function telegramEditError(description: string) {
+  return new GrammyError(
+    'edit failed',
+    { ok: false, error_code: 400, description },
+    'editMessageText',
+    { chat_id: -1001, message_id: 42 },
+  );
+}

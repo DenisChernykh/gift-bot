@@ -62,6 +62,7 @@ export interface GiveawayLifecycleRepository {
     deliveries: Array<{ id: string; giveawayChannelId: string }>;
     now: number;
   }): Promise<BeginPublicationResult>;
+  markPublicationDeliverySending(deliveryId: string, now: number): Promise<void>;
   savePublicationDelivery(input: {
     deliveryId: string;
     messageId: number;

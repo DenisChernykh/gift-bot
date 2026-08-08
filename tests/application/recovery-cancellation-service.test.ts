@@ -3,8 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { GrammyError, type Api } from 'grammy';
 
 import { GiveawayCancellationService } from '../../src/application/giveaway-cancellation-service.js';
+import { GiveawayPublicationService } from '../../src/application/giveaway-publication-service.js';
 import { GiveawayRecoveryService } from '../../src/application/giveaway-recovery-service.js';
 import {
   TelegramDeliveryError,
@@ -15,6 +17,8 @@ import {
 import { openDatabase, type DatabaseBoundary } from '../../src/database/client.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
+import { hashToken } from '../../src/domain/tokens.js';
+import { GrammyTelegramGateway } from '../../src/infrastructure/grammy-telegram-gateway.js';
 
 const NOW = Date.UTC(2026, 7, 8, 7, 0);
 const cleanups: Array<() => Promise<void>> = [];
@@ -39,8 +43,8 @@ class FakeTelegramGateway implements TelegramGateway {
   }
 
   async sendGiveawayMessage(_input: TelegramGiveawayMessage) {
-    void _input;
-    throw new Error('not used');
+    this.operations.push(`send:${_input.chatId}`);
+    return { messageId: 999 };
   }
 
   async deleteMessage(chatId: number, messageId: number) {
@@ -70,16 +74,22 @@ async function openLifecycleApplication() {
   };
   const cancellation = new GiveawayCancellationService(repository, gateway, dependencies);
   const recovery = new GiveawayRecoveryService(repository, gateway, { now: () => NOW });
+  const publication = new GiveawayPublicationService(repository, gateway, {
+    botUsername: 'gift_test_bot',
+    createId: (kind) => `${kind}-${++sequence}`,
+    createToken: () => ({ token: 'retry-token', tokenHash: hashToken('retry-token') }),
+    now: () => NOW,
+  });
   cleanups.push(async () => {
     await opened.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { ...opened, repository, gateway, cancellation, recovery };
+  return { ...opened, repository, gateway, cancellation, publication, recovery };
 }
 
 async function seedPublishingRun(
   database: DatabaseBoundary,
-  deliveryStatuses: Array<'pending' | 'delivered' | 'unknown'>,
+  deliveryStatuses: Array<'pending' | 'sending' | 'delivered' | 'unknown'>,
 ) {
   await seedGiveaway(database, 'publishing', deliveryStatuses.length);
   await database.execute(
@@ -183,6 +193,24 @@ describe('GiveawayRecoveryService', () => {
       { state: 'failed' },
     ]);
   });
+
+  it('fails closed after a crash between Telegram accepting a send and saving its message id', async () => {
+    const { database, gateway, publication, recovery } =
+      await openLifecycleApplication();
+    await seedPublishingRun(database, ['sending']);
+
+    expect(await recovery.recoverPublications()).toEqual([
+      { giveawayId: 'giveaway-1', kind: 'failed' },
+    ]);
+    expect(gateway.operations).toEqual([]);
+    await expect(publication.publish('giveaway-1')).rejects.toThrow(
+      'Giveaway cannot be published from failed',
+    );
+    expect(gateway.operations).toEqual([]);
+    expect(await database.all('select state from giveaways')).toEqual([
+      { state: 'failed' },
+    ]);
+  });
 });
 
 describe('GiveawayCancellationService', () => {
@@ -249,6 +277,56 @@ describe('GiveawayCancellationService', () => {
     expect(await cancellation.retryPendingSynchronization()).toBe(1);
     expect(await database.all('select status, attempts from sync_tasks')).toEqual([
       { status: 'completed', attempts: 2 },
+    ]);
+  });
+
+  it('completes a pending sync task when a prior edit succeeded before the process crashed', async () => {
+    const { database, repository } = await openLifecycleApplication();
+    await seedGiveaway(database, 'active', 1);
+    await database.execute(
+      "update giveaways set state = 'cancelled' where id = 'giveaway-1'",
+    );
+    await database.execute(
+      `insert into sync_tasks (
+         id, giveaway_id, giveaway_channel_id, task_type, payload,
+         status, attempts, created_at, updated_at
+       ) values ('sync-after-crash', 'giveaway-1', 'channel-1',
+                 'cancel_message', ?, 'pending', 0, ?, ?)`,
+      [
+        JSON.stringify({
+          chatId: -2001,
+          messageId: 401,
+          messageKind: 'text',
+          text: 'Розыгрыш отменён.',
+        }),
+        NOW,
+        NOW,
+      ],
+    );
+    const api = {
+      editMessageText: async () => {
+        throw new GrammyError(
+          'edit failed',
+          {
+            ok: false,
+            error_code: 400,
+            description:
+              'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
+          },
+          'editMessageText',
+          { chat_id: -2001, message_id: 401 },
+        );
+      },
+    } as unknown as Api;
+    const cancellation = new GiveawayCancellationService(
+      repository,
+      new GrammyTelegramGateway(api, 999),
+      { now: () => NOW },
+    );
+
+    expect(await cancellation.retryPendingSynchronization()).toBe(1);
+    expect(await database.all('select status, attempts from sync_tasks')).toEqual([
+      { status: 'completed', attempts: 1 },
     ]);
   });
 

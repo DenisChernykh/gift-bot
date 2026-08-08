@@ -93,7 +93,7 @@ export class GrammyTelegramGateway implements TelegramGateway {
 
   async editCancelledMessage(input: TelegramCancelledMessage): Promise<void> {
     if (input.kind === 'photo') {
-      await this.#call(() =>
+      await this.#editIdempotently(() =>
         this.#api.editMessageCaption(input.chatId, input.messageId, {
           caption: input.text,
           reply_markup: { inline_keyboard: [] },
@@ -101,11 +101,20 @@ export class GrammyTelegramGateway implements TelegramGateway {
       );
       return;
     }
-    await this.#call(() =>
+    await this.#editIdempotently(() =>
       this.#api.editMessageText(input.chatId, input.messageId, input.text, {
         reply_markup: { inline_keyboard: [] },
       }),
     );
+  }
+
+  async #editIdempotently(operation: () => Promise<unknown>): Promise<void> {
+    try {
+      await operation();
+    } catch (error) {
+      if (isMessageNotModifiedError(error)) return;
+      throw classifyTelegramError(error);
+    }
   }
 
   async #call<Result>(operation: () => Promise<Result>): Promise<Result> {
@@ -115,6 +124,18 @@ export class GrammyTelegramGateway implements TelegramGateway {
       throw classifyTelegramError(error);
     }
   }
+}
+
+const MESSAGE_NOT_MODIFIED_DESCRIPTION =
+  'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message';
+
+function isMessageNotModifiedError(error: unknown): boolean {
+  return (
+    error instanceof GrammyError &&
+    error.error_code === 400 &&
+    ['editMessageText', 'editMessageCaption'].includes(error.method) &&
+    error.description === MESSAGE_NOT_MODIFIED_DESCRIPTION
+  );
 }
 
 function participationKeyboard(joinUrl: string) {
