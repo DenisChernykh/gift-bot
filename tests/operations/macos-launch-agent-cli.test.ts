@@ -33,6 +33,10 @@ describe('macOS LaunchAgent CLI', () => {
     expect(parseLaunchAgentCommand([command])).toBe(command);
   });
 
+  it('accepts the separator forwarded by the documented pnpm command', () => {
+    expect(parseLaunchAgentCommand(['--', 'status'])).toBe('status');
+  });
+
   it.each([
     { argv: [] },
     { argv: ['install', '--force'] },

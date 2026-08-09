@@ -39,15 +39,16 @@ export type LaunchAgentCommand = (typeof COMMANDS)[number];
 export function parseLaunchAgentCommand(
   argv: readonly string[],
 ): LaunchAgentCommand {
+  const normalized = argv[0] === '--' ? argv.slice(1) : argv;
   if (
-    argv.length !== 1 ||
-    !COMMANDS.includes(argv[0] as LaunchAgentCommand)
+    normalized.length !== 1 ||
+    !COMMANDS.includes(normalized[0] as LaunchAgentCommand)
   ) {
     throw new Error(
       'Usage: pnpm ops:launch-agent -- install|start|stop|restart|status|logs|uninstall',
     );
   }
-  return argv[0] as LaunchAgentCommand;
+  return normalized[0] as LaunchAgentCommand;
 }
 
 function appendBounded(current: string, chunk: string): string {
