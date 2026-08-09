@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
@@ -29,6 +30,9 @@ const defaultDependencies: ProfileConfigurationDependencies = {
   applyProfile: applyProductionBotProfile,
 };
 
+const PRODUCTION_AVATAR_JPG_SHA256 =
+  '65b956ec057dd35b3ba989595c8923c62bf39dbc4ddcec1f972169052d5d5374';
+
 export function assertStaticJpeg(bytes: Uint8Array): void {
   const valid =
     bytes.length >= 5 &&
@@ -38,6 +42,11 @@ export function assertStaticJpeg(bytes: Uint8Array): void {
     bytes.at(-2) === 0xff &&
     bytes.at(-1) === 0xd9;
   if (!valid) throw new Error('Production avatar must be a JPG');
+
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  if (digest !== PRODUCTION_AVATAR_JPG_SHA256) {
+    throw new Error('Production avatar must match the approved JPG');
+  }
 }
 
 export function toSafeProfileFailure(error: unknown): {

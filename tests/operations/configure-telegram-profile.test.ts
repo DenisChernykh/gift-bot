@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { InputFile } from 'grammy';
 import { describe, expect, it } from 'vitest';
 
@@ -11,6 +13,7 @@ import {
   ProfileStepError,
   type ProductionProfileApi,
 } from '../../src/operations/telegram-profile-service.js';
+import { PRODUCTION_AVATAR_JPG_PATH } from '../../src/telegram/production-bot-profile.js';
 
 function fakeApi(): ProductionProfileApi {
   return {
@@ -24,10 +27,13 @@ function fakeApi(): ProductionProfileApi {
 }
 
 describe('configure telegram profile', () => {
-  it('accepts only complete JPG framing', () => {
-    expect(() =>
-      assertStaticJpeg(Uint8Array.from([0xff, 0xd8, 0xff, 0x00, 0xff, 0xd9])),
-    ).not.toThrow();
+  it('accepts the exact checked-in production JPG', async () => {
+    const approvedAvatar = await readFile(PRODUCTION_AVATAR_JPG_PATH);
+
+    expect(() => assertStaticJpeg(approvedAvatar)).not.toThrow();
+  });
+
+  it('rejects non-JPG and incomplete JPG framing', () => {
     expect(() =>
       assertStaticJpeg(Uint8Array.from([0x89, 0x50, 0x4e, 0x47])),
     ).toThrow('Production avatar must be a JPG');
@@ -36,11 +42,12 @@ describe('configure telegram profile', () => {
     ).toThrow('Production avatar must be a JPG');
   });
 
-  it('blocks profile application when the local avatar is invalid', async () => {
+  it('blocks profile application when marker-valid JPG bytes are substituted', async () => {
     let apiCreated = false;
     let profileApplied = false;
     const dependencies: ProfileConfigurationDependencies = {
-      readAvatar: async () => Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
+      readAvatar: async () =>
+        Uint8Array.from([0xff, 0xd8, 0xff, 0x00, 0xff, 0xd9]),
       createApi: () => {
         apiCreated = true;
         return fakeApi();
@@ -56,7 +63,7 @@ describe('configure telegram profile', () => {
         { botToken: 'local-test-token', operatorTelegramIds: [700] },
         dependencies,
       ),
-    ).rejects.toThrow('Production avatar must be a JPG');
+    ).rejects.toThrow('Production avatar must match the approved JPG');
 
     expect(apiCreated).toBe(false);
     expect(profileApplied).toBe(false);
@@ -73,8 +80,7 @@ describe('configure telegram profile', () => {
         }
       | undefined;
     const dependencies: ProfileConfigurationDependencies = {
-      readAvatar: async () =>
-        Uint8Array.from([0xff, 0xd8, 0xff, 0x00, 0xff, 0xd9]),
+      readAvatar: async () => readFile(PRODUCTION_AVATAR_JPG_PATH),
       createApi: (token) => {
         expect(token).toBe('local-test-token');
         return api;
