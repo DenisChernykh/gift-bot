@@ -141,9 +141,9 @@ describe('giveaway result rendering', () => {
       });
 
       expect(rendered.text.length).toBeLessThanOrEqual(maximumLength);
-      for (let placeNumber = 1; placeNumber <= 50; placeNumber += 1) {
-        expect(rendered.text).toContain(`${placeNumber}. `);
-      }
+      expect(resultPlaceNumbers(rendered.text)).toEqual(
+        Array.from({ length: 50 }, (_, index) => index + 1),
+      );
       expect(rendered.entities).toHaveLength(50);
       for (const entity of rendered.entities) {
         expect(entity.url).toMatch(/^tg:\/\/user\?id=\d+$/);
@@ -153,4 +153,49 @@ describe('giveaway result rendering', () => {
       }
     },
   );
+
+  it.each(['empty', 'mixed'] as const)(
+    'keeps all 50 %s photo places inside the caption limit',
+    (scenario) => {
+      const rendered = renderGiveawayResult({
+        title: 'П'.repeat(100),
+        kind: 'photo',
+        eligibleParticipantCount: scenario === 'empty' ? 0 : 25,
+        places: Array.from({ length: 50 }, (_, index) => ({
+          placeNumber: index + 1,
+          participant:
+            scenario === 'mixed' && index % 2 === 0
+              ? {
+                  telegramUserId: 20_000 + index,
+                  username: null,
+                  displayName: `${'Приватное длинное имя '.repeat(6)}${index}`,
+                }
+              : null,
+        })),
+      });
+
+      expect(rendered.text.length).toBeLessThanOrEqual(1_024);
+      expect(resultPlaceNumbers(rendered.text)).toEqual(
+        Array.from({ length: 50 }, (_, index) => index + 1),
+      );
+      expect(rendered.text).not.toContain('Приватное длинное имя');
+      expect(rendered.text).not.toContain('Место не заполнено');
+      expect(rendered.text.split('\n').filter((line) => line.endsWith('. Пусто')))
+        .toHaveLength(scenario === 'empty' ? 50 : 25);
+      expect(rendered.entities).toHaveLength(scenario === 'empty' ? 0 : 25);
+      for (const entity of rendered.entities) {
+        expect(entity.url).toMatch(/^tg:\/\/user\?id=\d+$/);
+        expect(
+          rendered.text.slice(entity.offset, entity.offset + entity.length),
+        ).toBe('Участник');
+      }
+    },
+  );
 });
+
+function resultPlaceNumbers(text: string): number[] {
+  return text.split('\n').flatMap((line) => {
+    const match = /^(\d+)\. /.exec(line);
+    return match ? [Number(match[1])] : [];
+  });
+}

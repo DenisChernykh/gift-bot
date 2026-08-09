@@ -72,7 +72,9 @@ function resultLines(
   }
   for (const place of input.places) {
     if (!place.participant) {
-      lines.push({ text: `${place.placeNumber}. Место не заполнено` });
+      lines.push({
+        text: `${place.placeNumber}. ${compact ? 'Пусто' : 'Место не заполнено'}`,
+      });
       continue;
     }
     const prefix = `${place.placeNumber}. `;
