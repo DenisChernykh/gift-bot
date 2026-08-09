@@ -391,7 +391,7 @@ async function seedChannelsWizard(
 }
 
 describe('grammY Gift Bot adapter authorization', () => {
-  it('checks the allowlist before every admin command and admin callback', async () => {
+  it('keeps public start open while blocking every admin command and callback', async () => {
     const { bot, database, fakeApi, callbacks } = await openTestBot();
     let updateId = 1;
     for (const command of ['/start', '/new', '/giveaways', '/cancel']) {
@@ -406,7 +406,7 @@ describe('grammY Gift Bot adapter authorization', () => {
     await bot.handleUpdate(callbackUpdate(updateId++, 999, `admin:${issued.token}`));
 
     expect(fakeApi.sentMessages().map((call) => call.payload.text)).toEqual([
-      'Эта команда недоступна.',
+      'Это официальный бот розыгрышей Татьяны Стрельчук. Чтобы участвовать, откройте кнопку «Участвовать» в конкурсном посте.',
       'Эта команда недоступна.',
       'Эта команда недоступна.',
       'Эта команда недоступна.',
@@ -415,6 +415,16 @@ describe('grammY Gift Bot adapter authorization', () => {
     expect(
       await database.all('select consumed_at from callback_actions'),
     ).toEqual([{ consumed_at: null }]);
+  });
+
+  it('shows the branded command summary to an allowlisted operator', async () => {
+    const { bot, fakeApi } = await openTestBot([700]);
+
+    await bot.handleUpdate(privateMessageUpdate(100, 700, '/start'));
+
+    expect(fakeApi.sentMessages()[0]!.payload.text).toBe(
+      'Добро пожаловать в «Розыгрыши Татьяны Стрельчук».\n\n/new — создать розыгрыш\n/giveaways — открыть мои розыгрыши\n/cancel — отменить розыгрыш или текущую настройку',
+    );
   });
 });
 

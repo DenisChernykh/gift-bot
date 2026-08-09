@@ -15,6 +15,7 @@ import { PublicationFailureError, type GiveawayPublicationService } from '../app
 import type { ActiveWizard } from '../application/ports/giveaway-creation-repository.js';
 import type { GiveawayMessageEntity } from '../domain/giveaway-validation.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
+import { ADMIN_START_MESSAGE, PUBLIC_START_MESSAGE } from './gift-bot-copy.js';
 
 const ADMIN_CALLBACK_PREFIX = 'admin:';
 const EXTERNAL_CALLBACK_PREFIX = 'external:';
@@ -65,10 +66,11 @@ export function registerGiftBotHandlers(
       );
       return;
     }
-    if (!(await requireAdministrator(context, dependencies))) return;
-    await context.reply(
-      'Gift Bot готов. /new — новый розыгрыш, /giveaways — список, /cancel — отмена.',
-    );
+    if (!dependencies.teamTelegramIds.has(context.from!.id)) {
+      await context.reply(PUBLIC_START_MESSAGE);
+      return;
+    }
+    await context.reply(ADMIN_START_MESSAGE);
   });
 
   bot.command('new', async (context) => {
