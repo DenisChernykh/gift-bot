@@ -159,6 +159,43 @@ describe('SqliteDrawRepository', () => {
     ]);
   });
 
+  it('returns a clean loser result when independent SQLite connections claim concurrently', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'gift-bot-draw-processes-'));
+    const databasePath = join(directory, 'gift-bot.sqlite');
+    const first = openDatabase(databasePath);
+    await migrateDatabase(first.database);
+    const second = openDatabase(databasePath);
+    cleanups.push(async () => {
+      await Promise.all([first.close(), second.close()]);
+      rmSync(directory, { force: true, recursive: true });
+    });
+    await seedGiveaway(first.database, 'one');
+    const firstRepository = new SqliteDrawRepository(first.database);
+    const secondRepository = new SqliteDrawRepository(second.database);
+
+    const claims = await Promise.allSettled([
+      firstRepository.claimNextDue(NOW),
+      secondRepository.claimNextDue(NOW),
+    ]);
+
+    expect(claims.every((claim) => claim.status === 'fulfilled')).toBe(true);
+    expect(
+      claims.map((claim) =>
+        claim.status === 'fulfilled' ? (claim.value?.id ?? null) : 'rejected',
+      ),
+    ).toEqual(expect.arrayContaining(['one', null]));
+    expect(
+      await first.database.all(
+        "select state from giveaways where id = 'one'",
+      ),
+    ).toEqual([{ state: 'drawing' }]);
+    expect(
+      await first.database.all(
+        "select count(*) as count from draw_runs where giveaway_id = 'one'",
+      ),
+    ).toEqual([{ count: 1 }]);
+  });
+
   it('persists the first snapshot and returns it unchanged after restart', async () => {
     const { database, repository } = await openDrawDatabase();
     await seedGiveaway(database, 'one');

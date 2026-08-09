@@ -32,10 +32,15 @@ type DrawRepositoryDependencies = {
       | 'sync_task'
       | 'draw_notification',
   ) => string;
+  sleep: (milliseconds: number) => Promise<void>;
+  maximumClaimAttempts: number;
 };
 
 const defaultDependencies: DrawRepositoryDependencies = {
   createId: (kind) => `${kind}-${crypto.randomUUID()}`,
+  sleep: (milliseconds) =>
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+  maximumClaimAttempts: 5,
 };
 
 export class SqliteDrawRepository
@@ -50,10 +55,42 @@ export class SqliteDrawRepository
   ) {
     this.#database = database;
     this.#dependencies = { ...defaultDependencies, ...dependencies };
+    if (
+      !Number.isInteger(this.#dependencies.maximumClaimAttempts) ||
+      this.#dependencies.maximumClaimAttempts < 1
+    ) {
+      throw new Error('Maximum draw claim attempts must be a positive integer');
+    }
   }
 
   async claimNextDue(now: number): Promise<DrawTarget | null> {
-    const giveawayId = await this.#database.transaction(async (transaction) => {
+    let giveawayId: string | null | undefined;
+    for (
+      let attempt = 1;
+      attempt <= this.#dependencies.maximumClaimAttempts;
+      attempt += 1
+    ) {
+      try {
+        giveawayId = await this.#claimNextDueId(now);
+        break;
+      } catch (error) {
+        if (
+          !isSqliteBusyError(error) ||
+          attempt === this.#dependencies.maximumClaimAttempts
+        ) {
+          throw error;
+        }
+        await this.#dependencies.sleep(attempt * 10);
+      }
+    }
+    if (giveawayId === undefined) {
+      throw new Error('Unreachable draw claim retry state');
+    }
+    return giveawayId ? this.getDrawing(giveawayId) : null;
+  }
+
+  #claimNextDueId(now: number): Promise<string | null> {
+    return this.#database.transaction(async (transaction) => {
       const rows = await transaction.all<{ id: string }>(
         `select id from giveaways
           where state = 'active' and deadline_utc <= ?
@@ -82,7 +119,6 @@ export class SqliteDrawRepository
       }
       return id;
     });
-    return giveawayId ? this.getDrawing(giveawayId) : null;
   }
 
   async listDrawing(): Promise<DrawTarget[]> {
@@ -1338,6 +1374,20 @@ function notificationText(payload: string): string {
     throw new Error('Draw notification text is missing');
   }
   return parsed.text;
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const sqliteError = error as Error & {
+    errcode?: number;
+    errstr?: string;
+  };
+  return (
+    sqliteError.errcode === 5 ||
+    /database (?:is )?(?:locked|busy)/i.test(
+      `${sqliteError.message} ${sqliteError.errstr ?? ''}`,
+    )
+  );
 }
 
 function resultOperationId(payload: string): string | null {
