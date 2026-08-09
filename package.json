@@ -15,6 +15,7 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/database/migrate.ts",
     "lint": "eslint .",
+    "ops:launch-agent": "tsx src/operations/macos-launch-agent-cli.ts",
     "profile:apply": "tsx src/operations/configure-telegram-profile.ts",
     "start": "node dist/index.js",
     "test": "vitest run"

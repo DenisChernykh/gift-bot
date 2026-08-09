@@ -1,0 +1,186 @@
+import { spawn } from 'node:child_process';
+import {
+  access,
+  link,
+  mkdir,
+  open,
+  readFile,
+  unlink,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { Api } from 'grammy';
+
+import {
+  MacosLaunchAgentService,
+  type CommandResult,
+  type LaunchAgentHost,
+} from './macos-launch-agent-service.js';
+import {
+  LAUNCH_AGENT_LABEL,
+  resolveLaunchAgentPaths,
+} from './macos-launch-agent-plist.js';
+
+const COMMANDS = [
+  'install',
+  'start',
+  'stop',
+  'restart',
+  'status',
+  'logs',
+  'uninstall',
+] as const;
+const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
+
+export type LaunchAgentCommand = (typeof COMMANDS)[number];
+
+export function parseLaunchAgentCommand(
+  argv: readonly string[],
+): LaunchAgentCommand {
+  if (
+    argv.length !== 1 ||
+    !COMMANDS.includes(argv[0] as LaunchAgentCommand)
+  ) {
+    throw new Error(
+      'Usage: pnpm ops:launch-agent -- install|start|stop|restart|status|logs|uninstall',
+    );
+  }
+  return argv[0] as LaunchAgentCommand;
+}
+
+function appendBounded(current: string, chunk: string): string {
+  return `${current}${chunk}`.slice(-MAX_COMMAND_OUTPUT_BYTES);
+}
+
+function runCommand(
+  command: string,
+  args: readonly string[],
+): Promise<CommandResult> {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(command, [...args], {
+      shell: false,
+      env: process.env,
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout = appendBounded(stdout, chunk);
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr = appendBounded(stderr, chunk);
+    });
+    child.once('error', reject);
+    child.once('close', (code) => {
+      resolveResult({ exitCode: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'ENOENT';
+}
+
+export function createLaunchAgentHost(): LaunchAgentHost {
+  return {
+    openRead: async (path) => {
+      const handle = await open(path, 'r');
+      return {
+        stat: async () => {
+          const value = await handle.stat();
+          return { mode: value.mode, uid: value.uid };
+        },
+        readFile: async () => handle.readFile(),
+        close: async () => handle.close(),
+      };
+    },
+    readFile,
+    exists: async (path) => {
+      try {
+        await access(path);
+        return true;
+      } catch (error) {
+        if (isMissing(error)) return false;
+        throw error;
+      }
+    },
+    mkdir: async (path) => {
+      await mkdir(path, { recursive: true });
+    },
+    writeFileExclusive: async (path, contents, mode) => {
+      const handle = await open(path, 'wx', mode);
+      try {
+        await handle.writeFile(contents, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    },
+    link,
+    unlink,
+    run: runCommand,
+    verifyBotUsername: async (token) => (await new Api(token).getMe()).username,
+    readText: async (path) => readFile(path, 'utf8'),
+  };
+}
+
+export function toSafeOperationsFailure(error: unknown): {
+  event: 'launch_agent_command_failed';
+  errorName: string;
+} {
+  return {
+    event: 'launch_agent_command_failed',
+    errorName: error instanceof Error ? error.name : 'UnknownError',
+  };
+}
+
+export async function main(): Promise<void> {
+  if (process.platform !== 'darwin' || process.getuid === undefined) {
+    throw new Error('macOS GUI user is required');
+  }
+  const command = parseLaunchAgentCommand(process.argv.slice(2));
+  const paths = resolveLaunchAgentPaths({
+    homeDirectory: homedir(),
+    repoRoot: process.cwd(),
+    nodePath: process.execPath,
+  });
+  const service = new MacosLaunchAgentService({
+    host: createLaunchAgentHost(),
+    paths,
+    uid: process.getuid(),
+    nodeVersion: process.versions.node,
+  });
+
+  if (command === 'status') {
+    console.log(JSON.stringify(await service.status()));
+    return;
+  }
+  if (command === 'logs') {
+    const logs = await service.logs();
+    console.log(`stdout:\n${logs.stdout}\n\nstderr:\n${logs.stderr}`);
+    return;
+  }
+  await service[command]();
+  console.log(
+    JSON.stringify({
+      event: 'launch_agent_command_completed',
+      command,
+      label: LAUNCH_AGENT_LABEL,
+    }),
+  );
+}
+
+if (
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  void main().catch((error) => {
+    console.error(JSON.stringify(toSafeOperationsFailure(error)));
+    process.exitCode = 1;
+  });
+}
