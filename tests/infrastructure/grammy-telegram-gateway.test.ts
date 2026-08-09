@@ -119,6 +119,7 @@ describe('GrammyTelegramGateway cancellation edits', () => {
       text: 'Updated',
       entities: [{ type: 'bold', offset: 0, length: 7 }],
       removeParticipationButton: false,
+      joinUrl: 'https://t.me/gift_test_bot?start=join_reissued-token',
     });
     await gateway.editCancelledMessage({
       chatId: -1001,
@@ -129,11 +130,63 @@ describe('GrammyTelegramGateway cancellation edits', () => {
 
     expect(calls[0]).toEqual({
       entities: [{ type: 'bold', offset: 0, length: 7 }],
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: 'Участвовать',
+              url: 'https://t.me/gift_test_bot?start=join_reissued-token',
+            },
+          ],
+        ],
+      },
     });
     expect(calls[1]).toEqual({
       entities: [],
       reply_markup: { inline_keyboard: [] },
     });
+  });
+
+  it('preserves the participation keyboard for photo counter edits', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const api = {
+      editMessageCaption: async (
+        _chatId: number,
+        _messageId: number,
+        options: Record<string, unknown>,
+      ) => {
+        calls.push(options);
+        return true;
+      },
+    } as unknown as Api;
+    const gateway = new GrammyTelegramGateway(api, 999);
+
+    await gateway.editGiveawayPost({
+      chatId: -1001,
+      messageId: 42,
+      kind: 'photo',
+      text: 'Updated caption',
+      entities: [{ type: 'italic', offset: 0, length: 7 }],
+      removeParticipationButton: false,
+      joinUrl: 'https://t.me/gift_test_bot?start=join_photo-token',
+    });
+
+    expect(calls).toEqual([
+      {
+        caption: 'Updated caption',
+        caption_entities: [{ type: 'italic', offset: 0, length: 7 }],
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: 'Участвовать',
+                url: 'https://t.me/gift_test_bot?start=join_photo-token',
+              },
+            ],
+          ],
+        },
+      },
+    ]);
   });
 });
 

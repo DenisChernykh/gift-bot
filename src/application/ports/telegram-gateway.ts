@@ -20,14 +20,19 @@ export type TelegramCancelledMessage = {
   text: string;
 };
 
-export type TelegramPostEdit = {
+type TelegramPostEditBase = {
   chatId: number;
   messageId: number;
   kind: 'text' | 'photo';
   text: string;
   entities: TelegramMessageEntity[];
-  removeParticipationButton: boolean;
 };
+
+export type TelegramPostEdit = TelegramPostEditBase &
+  (
+    | { removeParticipationButton: true }
+    | { removeParticipationButton: false; joinUrl: string }
+  );
 
 export type TelegramDeliveryOutcome = 'definite' | 'unknown';
 

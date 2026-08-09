@@ -96,7 +96,9 @@ async function openLifecycleApplication() {
     now: () => NOW,
   };
   const synchronization = new GiveawayPostSynchronizationService(
-    new SqlitePostSynchronizationRepository(opened.database),
+    new SqlitePostSynchronizationRepository(opened.database, {
+      botUsername: 'gift_test_bot',
+    }),
     gateway,
     { now: () => NOW },
   );
@@ -541,7 +543,9 @@ describe('GiveawayCancellationService', () => {
     const cancellation = new GiveawayCancellationService(
       repository,
       new GiveawayPostSynchronizationService(
-        new SqlitePostSynchronizationRepository(database),
+        new SqlitePostSynchronizationRepository(database, {
+          botUsername: 'gift_test_bot',
+        }),
         new GrammyTelegramGateway(api, 999),
         { now: () => NOW },
       ),

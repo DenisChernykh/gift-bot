@@ -148,7 +148,7 @@ export class GrammyTelegramGateway implements TelegramGateway {
           caption_entities: input.entities,
           ...(input.removeParticipationButton
             ? { reply_markup: { inline_keyboard: [] } }
-            : {}),
+            : { reply_markup: participationKeyboard(input.joinUrl) }),
         }),
       );
       return;
@@ -158,7 +158,7 @@ export class GrammyTelegramGateway implements TelegramGateway {
         entities: input.entities,
         ...(input.removeParticipationButton
           ? { reply_markup: { inline_keyboard: [] } }
-          : {}),
+          : { reply_markup: participationKeyboard(input.joinUrl) }),
       }),
     );
   }

@@ -4,16 +4,37 @@ import type {
 } from '../application/ports/post-synchronization-repository.js';
 import type { TelegramPostEdit } from '../application/ports/telegram-gateway.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
+import { createStoredToken } from '../domain/tokens.js';
 import type { GiveawayMessageEntity } from '../domain/giveaway-validation.js';
 import type { DatabaseBoundary } from './client.js';
+
+type PostSynchronizationRepositoryDependencies = {
+  botUsername: string;
+  createToken: typeof createStoredToken;
+  now: () => number;
+};
+
+const defaultDependencies: Omit<
+  PostSynchronizationRepositoryDependencies,
+  'botUsername'
+> = {
+  createToken: createStoredToken,
+  now: Date.now,
+};
 
 export class SqlitePostSynchronizationRepository
   implements PostSynchronizationRepository
 {
   readonly #database: DatabaseBoundary;
+  readonly #dependencies: PostSynchronizationRepositoryDependencies;
 
-  constructor(database: DatabaseBoundary) {
+  constructor(
+    database: DatabaseBoundary,
+    dependencies: Partial<PostSynchronizationRepositoryDependencies> &
+      Pick<PostSynchronizationRepositoryDependencies, 'botUsername'>,
+  ) {
     this.#database = database;
+    this.#dependencies = { ...defaultDependencies, ...dependencies };
   }
 
   async recoverInterrupted(now: number): Promise<void> {
@@ -92,68 +113,84 @@ export class SqlitePostSynchronizationRepository
       };
     }
 
-    const rows = await this.#database.all<{
-      state: string;
-      title: string;
-      winnerCount: number;
-      deadlineUtc: number;
-      referralsEnabled: number;
-      contentKind: 'text' | 'photo';
-      contentText: string;
-      contentEntities: string;
-      chatId: number;
-      messageId: number;
-      messageKind: 'text' | 'photo';
-      participantCount: number;
-    }>(
-      `select g.state, g.title, g.winner_count as winnerCount,
-              g.deadline_utc as deadlineUtc,
-              g.referrals_enabled as referralsEnabled,
-              g.content_kind as contentKind, g.content_text as contentText,
-              g.content_entities as contentEntities,
-              c.telegram_chat_id as chatId, d.message_id as messageId,
-              d.message_kind as messageKind,
-              (select count(*) from participants p
-                where p.giveaway_id = g.id) as participantCount
-         from sync_tasks t
-         join giveaways g on g.id = t.giveaway_id
-         join giveaway_channels c on c.id = t.giveaway_channel_id
-         join publication_deliveries d on d.giveaway_channel_id = c.id
-         join publication_runs r on r.id = d.publication_run_id
-        where t.id = ? and r.giveaway_id = g.id and r.status = 'succeeded'
-          and d.status = 'delivered' and d.message_id is not null
-        order by d.created_at desc, d.id desc limit 1`,
-      [task.id],
-    );
-    const row = rows[0];
-    if (!row || row.state !== 'active') return null;
-    const content =
-      row.contentKind === 'text'
-        ? ({ kind: 'text', text: row.contentText } as const)
-        : ({ kind: 'photo', caption: row.contentText } as const);
-    const rendered = renderGiveawayMessage(
-      {
-        title: row.title,
-        winnerCount: row.winnerCount,
-        deadlineUtc: row.deadlineUtc,
-        referralsEnabled: row.referralsEnabled === 1,
-        content,
-      },
-      row.participantCount,
-    );
-    const sourceEntities = JSON.parse(row.contentEntities) as GiveawayMessageEntity[];
-    const contentOffset = row.title.length + 2;
-    return {
-      chatId: row.chatId,
-      messageId: row.messageId,
-      kind: row.messageKind,
-      text: rendered.text,
-      entities: sourceEntities.map((entity) => ({
-        ...entity,
-        offset: entity.offset + contentOffset,
-      })),
-      removeParticipationButton: false,
-    };
+    return this.#database.transaction(async (transaction) => {
+      const rows = await transaction.all<{
+        state: string;
+        giveawayId: string;
+        title: string;
+        winnerCount: number;
+        deadlineUtc: number;
+        referralsEnabled: number;
+        contentKind: 'text' | 'photo';
+        contentText: string;
+        contentEntities: string;
+        chatId: number;
+        messageId: number;
+        messageKind: 'text' | 'photo';
+        participantCount: number;
+      }>(
+        `select g.state, g.id as giveawayId, g.title,
+                g.winner_count as winnerCount,
+                g.deadline_utc as deadlineUtc,
+                g.referrals_enabled as referralsEnabled,
+                g.content_kind as contentKind, g.content_text as contentText,
+                g.content_entities as contentEntities,
+                c.telegram_chat_id as chatId, d.message_id as messageId,
+                d.message_kind as messageKind,
+                (select count(*) from participants p
+                  where p.giveaway_id = g.id) as participantCount
+           from sync_tasks t
+           join giveaways g on g.id = t.giveaway_id
+           join giveaway_channels c on c.id = t.giveaway_channel_id
+           join publication_deliveries d on d.giveaway_channel_id = c.id
+           join publication_runs r on r.id = d.publication_run_id
+          where t.id = ? and r.giveaway_id = g.id and r.status = 'succeeded'
+            and d.status = 'delivered' and d.message_id is not null
+          order by d.created_at desc, d.id desc limit 1`,
+        [task.id],
+      );
+      const row = rows[0];
+      if (!row || row.state !== 'active') return null;
+
+      const joinToken = this.#dependencies.createToken();
+      await transaction.execute(
+        `insert into join_tokens (
+           token_hash, giveaway_id, state, expires_at, created_at
+         ) values (?, ?, 'active', null, ?)`,
+        [joinToken.tokenHash, row.giveawayId, this.#dependencies.now()],
+      );
+
+      const content =
+        row.contentKind === 'text'
+          ? ({ kind: 'text', text: row.contentText } as const)
+          : ({ kind: 'photo', caption: row.contentText } as const);
+      const rendered = renderGiveawayMessage(
+        {
+          title: row.title,
+          winnerCount: row.winnerCount,
+          deadlineUtc: row.deadlineUtc,
+          referralsEnabled: row.referralsEnabled === 1,
+          content,
+        },
+        row.participantCount,
+      );
+      const sourceEntities = JSON.parse(
+        row.contentEntities,
+      ) as GiveawayMessageEntity[];
+      const contentOffset = row.title.length + 2;
+      return {
+        chatId: row.chatId,
+        messageId: row.messageId,
+        kind: row.messageKind,
+        text: rendered.text,
+        entities: sourceEntities.map((entity) => ({
+          ...entity,
+          offset: entity.offset + contentOffset,
+        })),
+        removeParticipationButton: false,
+        joinUrl: `https://t.me/${this.#dependencies.botUsername}?start=join_${joinToken.token}`,
+      };
+    });
   }
 
   async completeTask(input: {

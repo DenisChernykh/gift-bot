@@ -47,7 +47,9 @@ bot.use(inFlightUpdates.middleware());
 const gateway = new GrammyTelegramGateway(bot.api, bot.botInfo.id);
 const participantRepository = new SqliteParticipantRepository(opened.database);
 const postSynchronization = new GiveawayPostSynchronizationService(
-  new SqlitePostSynchronizationRepository(opened.database),
+  new SqlitePostSynchronizationRepository(opened.database, {
+    botUsername: bot.botInfo.username,
+  }),
   gateway,
 );
 const alerts = new ChannelHealthAlertService(participantRepository, gateway);

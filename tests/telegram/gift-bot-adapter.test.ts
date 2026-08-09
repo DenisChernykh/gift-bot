@@ -176,7 +176,9 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     },
   );
   const synchronization = new GiveawayPostSynchronizationService(
-    new SqlitePostSynchronizationRepository(opened.database),
+    new SqlitePostSynchronizationRepository(opened.database, {
+      botUsername: 'gift_test_bot',
+    }),
     telegramGateway,
     { now },
   );

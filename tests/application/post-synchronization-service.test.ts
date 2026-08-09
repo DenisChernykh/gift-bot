@@ -11,6 +11,7 @@ import { openDatabase } from '../../src/database/client.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
 import { SqliteParticipantRepository } from '../../src/database/participant-repository.js';
 import { SqlitePostSynchronizationRepository } from '../../src/database/post-synchronization-repository.js';
+import { hashToken } from '../../src/domain/tokens.js';
 
 const NOW = Date.UTC(2026, 7, 9, 9, 0);
 const cleanups: Array<() => Promise<void>> = [];
@@ -95,9 +96,17 @@ async function openSynchronization() {
                '{"targetCount":1}', 'pending', 0, ?, null, ?, ?)`,
     [NOW, NOW, NOW],
   );
-  const gateway = new FakeEditGateway();
-  const repository = new SqlitePostSynchronizationRepository(opened.database);
   let currentNow = NOW;
+  let joinTokenSequence = 0;
+  const gateway = new FakeEditGateway();
+  const repository = new SqlitePostSynchronizationRepository(opened.database, {
+    botUsername: 'gift_test_bot',
+    createToken: () => {
+      const token = `counter-token-${++joinTokenSequence}`;
+      return { token, tokenHash: hashToken(token) };
+    },
+    now: () => currentNow,
+  });
   const service = new GiveawayPostSynchronizationService(repository, gateway, {
     now: () => currentNow,
   });
@@ -125,8 +134,17 @@ describe('giveaway post synchronization', () => {
         kind: 'text',
         entities: [{ type: 'bold', offset: 6, length: 4 }],
         removeParticipationButton: false,
+        joinUrl:
+          'https://t.me/gift_test_bot?start=join_counter-token-1',
         text: expect.stringContaining('Зарегистрировано участников: 1'),
       }),
+    ]);
+    expect(
+      await database.all(
+        'select token_hash, state from join_tokens order by created_at',
+      ),
+    ).toEqual([
+      { token_hash: hashToken('counter-token-1'), state: 'active' },
     ]);
     expect(
       await database.all(
