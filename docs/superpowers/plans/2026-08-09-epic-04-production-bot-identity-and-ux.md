@@ -113,7 +113,7 @@ sips -s format jpeg -s formatOptions 95 assets/telegram/strelchuk-giveaways-avat
 sips -g pixelWidth -g pixelHeight assets/telegram/strelchuk-giveaways-avatar-source.png assets/telegram/strelchuk-giveaways-avatar.jpg
 ```
 
-Expected: both files report `1024` by `1024`; the source artwork remains unchanged.
+Expected: both files report `1254` by `1254`; the source artwork remains unchanged.
 
 - [ ] **Step 4: Add the exact immutable target module**
 
