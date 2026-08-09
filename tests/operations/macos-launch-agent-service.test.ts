@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_LOG_TAIL_BYTES,
   MacosLaunchAgentService,
   type LaunchAgentHost,
 } from '../../src/operations/macos-launch-agent-service.js';
@@ -10,6 +11,7 @@ const paths = resolveLaunchAgentPaths({
   homeDirectory: '/Users/tatiana',
   repoRoot: '/Users/tatiana/projects/gift-bot',
   nodePath: '/opt/node/bin/node',
+  temporaryFileSuffix: 'service-fixture',
 });
 
 const validEnvironment = Buffer.from(
@@ -37,6 +39,8 @@ function fixture(options: {
   installed?: boolean;
   loaded?: boolean;
   linkErrorCode?: string;
+  lintReject?: boolean;
+  writeErrorCode?: string;
 } = {}) {
   const events: string[] = [];
   const files = new Map<string, Buffer | string>([
@@ -83,10 +87,18 @@ function fixture(options: {
       events.push(`writeExclusive:${path}:${mode.toString(8)}`);
       if (files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
       files.set(path, contents);
+      if (options.writeErrorCode) {
+        throw Object.assign(new Error('partial write failed'), {
+          code: options.writeErrorCode,
+        });
+      }
     },
     link: async (from, to) => {
       events.push(`link:${from}:${to}`);
       if (options.linkErrorCode) {
+        if (options.linkErrorCode === 'EEXIST') {
+          files.set(to, 'concurrent plist bytes');
+        }
         throw Object.assign(new Error('link failed'), {
           code: options.linkErrorCode,
         });
@@ -106,6 +118,7 @@ function fixture(options: {
         return { exitCode: 0, stdout: '11.15.1\n', stderr: '' };
       }
       if (command === 'plutil') {
+        if (options.lintReject) throw new Error('plutil spawn rejected');
         return {
           exitCode: options.lintExitCode ?? 0,
           stdout: '',
@@ -132,7 +145,7 @@ function fixture(options: {
       events.push('verifyBotUsername');
       return options.username ?? 'strelchuk_giveaways_bot';
     },
-    readText: async () => '',
+    readTail: async () => '',
   };
 
   return {
@@ -149,7 +162,9 @@ function fixture(options: {
 
 function firstMutation(events: readonly string[]): number {
   return events.findIndex((event) =>
-    /^(mkdir|writeExclusive|link|unlink):/.test(event),
+    /^(mkdir|writeExclusive|link|unlink):|^run:launchctl:(bootstrap|bootout)(?: |:)/.test(
+      event,
+    ),
   );
 }
 
@@ -205,6 +220,12 @@ describe('MacosLaunchAgentService install', () => {
     );
 
     expect(firstMutation(events)).toBe(-1);
+    expect(events.some((event) => event.includes('launchctl:bootstrap'))).toBe(
+      false,
+    );
+    expect(events.some((event) => event.includes('launchctl:bootout'))).toBe(
+      false,
+    );
     expect(events.join('\n')).not.toContain('secret_test_value');
   });
 
@@ -219,13 +240,31 @@ describe('MacosLaunchAgentService install', () => {
     expect(events.join('\n')).not.toContain('raw lint detail');
   });
 
+  it('cleans its unique temporary file when plutil spawning rejects', async () => {
+    const { service, files } = fixture({ lintReject: true });
+
+    await expect(service.install()).rejects.toThrow();
+
+    expect(files.has(paths.temporaryPlistPath)).toBe(false);
+    expect(files.has(paths.plistPath)).toBe(false);
+  });
+
+  it('cleans a partially created unique temporary file after a write failure', async () => {
+    const { service, files } = fixture({ writeErrorCode: 'EIO' });
+
+    await expect(service.install()).rejects.toThrow();
+
+    expect(files.has(paths.temporaryPlistPath)).toBe(false);
+    expect(files.has(paths.plistPath)).toBe(false);
+  });
+
   it('does not overwrite a plist created concurrently during publication', async () => {
     const { service, events, files } = fixture({ linkErrorCode: 'EEXIST' });
 
     await expect(service.install()).rejects.toThrow('already installed');
 
     expect(files.has(paths.temporaryPlistPath)).toBe(false);
-    expect(files.has(paths.plistPath)).toBe(false);
+    expect(files.get(paths.plistPath)).toBe('concurrent plist bytes');
     expect(
       events.some(
         (event) => event === `run:launchctl:bootstrap gui/501 ${paths.plistPath}`,
@@ -275,12 +314,13 @@ function lifecycleFixture(options: { installed?: boolean; loaded?: boolean } = {
       return { exitCode: 0, stdout: '', stderr: '' };
     },
     verifyBotUsername: async () => 'strelchuk_giveaways_bot',
-    readText: async (path) => {
+    readTail: async (path, maximumBytes) => {
+      events.push(`readTail:${path}:${maximumBytes}`);
       const value = logs.get(path);
       if (value === undefined) {
         throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       }
-      return value;
+      return Buffer.from(value).subarray(-maximumBytes).toString('utf8');
     },
   };
 
@@ -302,13 +342,13 @@ describe('MacosLaunchAgentService lifecycle', () => {
   it('uses bootout for maintenance stop and bootstrap for start', async () => {
     const { service, events, isLoaded } = lifecycleFixture({ loaded: true });
 
-    await service.stop();
+    await expect(service.stop()).resolves.toBe('stopped');
     expect(isLoaded()).toBe(false);
     expect(events.at(-1)).toBe(
       'run:launchctl:bootout gui/501/ru.strelchuk.giveaways-bot',
     );
 
-    await service.start();
+    await expect(service.start()).resolves.toBe('started');
     expect(isLoaded()).toBe(true);
     expect(events.at(-1)).toBe(
       `run:launchctl:bootstrap gui/501 ${paths.plistPath}`,
@@ -318,10 +358,10 @@ describe('MacosLaunchAgentService lifecycle', () => {
   it('keeps repeated start and stop idempotent', async () => {
     const { service, events } = lifecycleFixture();
 
-    await service.start();
-    await service.start();
-    await service.stop();
-    await service.stop();
+    await expect(service.start()).resolves.toBe('started');
+    await expect(service.start()).resolves.toBe('already_loaded');
+    await expect(service.stop()).resolves.toBe('stopped');
+    await expect(service.stop()).resolves.toBe('already_absent');
 
     expect(events.filter((event) => event.includes(':bootstrap '))).toHaveLength(1);
     expect(events.filter((event) => event.includes(':bootout '))).toHaveLength(1);
@@ -330,7 +370,7 @@ describe('MacosLaunchAgentService lifecycle', () => {
   it('restarts through an explicit bootout and bootstrap pair', async () => {
     const { service, events, isLoaded } = lifecycleFixture({ loaded: true });
 
-    await service.restart();
+    await expect(service.restart()).resolves.toBe('restarted');
 
     expect(isLoaded()).toBe(true);
     expect(events.filter((event) => event.includes(':bootout '))).toHaveLength(1);
@@ -340,7 +380,7 @@ describe('MacosLaunchAgentService lifecycle', () => {
   it('uninstalls only the service registration and plist', async () => {
     const { service, events, files } = lifecycleFixture({ loaded: true });
 
-    await service.uninstall();
+    await expect(service.uninstall()).resolves.toBe('uninstalled');
 
     expect(events).toContain(
       'run:launchctl:bootout gui/501/ru.strelchuk.giveaways-bot',
@@ -353,11 +393,14 @@ describe('MacosLaunchAgentService lifecycle', () => {
     expect(events.join('\n')).not.toContain('gift-bot.sqlite');
   });
 
-  it('returns status and bounded log tails without parsing launchctl output', async () => {
-    const { service, logs } = lifecycleFixture({ loaded: true });
+  it('returns status, paths and byte-bounded log tails without parsing launchctl output', async () => {
+    const { service, events, logs } = lifecycleFixture({ loaded: true });
     logs.set(
       paths.stdoutPath,
-      Array.from({ length: 120 }, (_, index) => `stdout:${index + 1}`).join('\n'),
+      `${'x'.repeat(MAX_LOG_TAIL_BYTES * 2)}\n${Array.from(
+        { length: 120 },
+        (_, index) => `stdout:${index + 1}`,
+      ).join('\n')}`,
     );
 
     await expect(service.status()).resolves.toEqual({
@@ -370,10 +413,25 @@ describe('MacosLaunchAgentService lifecycle', () => {
       stderrPath: paths.stderrPath,
     });
     const result = await service.logs();
+    expect(result.stdoutPath).toBe(paths.stdoutPath);
+    expect(result.stderrPath).toBe(paths.stderrPath);
     expect(result.stdout.split('\n')).toHaveLength(100);
     expect(result.stdout).toContain('stdout:21');
     expect(result.stdout).toContain('stdout:120');
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(
+      MAX_LOG_TAIL_BYTES,
+    );
     expect(result.stderr).toBe('');
+    expect(events).toContain(
+      `readTail:${paths.stdoutPath}:${MAX_LOG_TAIL_BYTES}`,
+    );
+  });
+
+  it('reports already_absent when repeated uninstall has nothing to remove', async () => {
+    const { service } = lifecycleFixture({ installed: false, loaded: false });
+
+    await expect(service.uninstall()).resolves.toBe('already_absent');
+    await expect(service.uninstall()).resolves.toBe('already_absent');
   });
 
   it('refuses to start without an installed plist', async () => {

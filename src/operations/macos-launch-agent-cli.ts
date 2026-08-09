@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   access,
   link,
@@ -17,6 +18,8 @@ import {
   MacosLaunchAgentService,
   type CommandResult,
   type LaunchAgentHost,
+  type LaunchAgentLogs,
+  type LaunchAgentOperationState,
 } from './macos-launch-agent-service.js';
 import {
   LAUNCH_AGENT_LABEL,
@@ -87,6 +90,86 @@ function isMissing(error: unknown): boolean {
   return error instanceof Error && 'code' in error && error.code === 'ENOENT';
 }
 
+type ExclusiveWriteHandle = {
+  writeFile(contents: string, encoding: BufferEncoding): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+};
+
+type ExclusiveWriteDependencies = {
+  openFile(
+    path: string,
+    flags: 'wx',
+    mode: number,
+  ): Promise<ExclusiveWriteHandle>;
+  unlinkFile(path: string): Promise<void>;
+};
+
+export async function writeFileExclusiveAndSync(
+  path: string,
+  contents: string,
+  mode: number,
+  dependencies: ExclusiveWriteDependencies = {
+    openFile: open,
+    unlinkFile: unlink,
+  },
+): Promise<void> {
+  const handle = await dependencies.openFile(path, 'wx', mode);
+  let closed = false;
+  try {
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+    await handle.close();
+    closed = true;
+  } catch (error) {
+    if (!closed) {
+      try {
+        await handle.close();
+      } catch {
+        // The original write/sync/close failure remains authoritative.
+      }
+    }
+    try {
+      await dependencies.unlinkFile(path);
+    } catch (unlinkError) {
+      if (!isMissing(unlinkError)) {
+        throw new AggregateError(
+          [error, unlinkError],
+          'Exclusive temporary file cleanup failed',
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function readTail(path: string, maximumBytes: number): Promise<string> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
+    throw new Error('Log tail byte limit must be a positive safe integer');
+  }
+  const handle = await open(path, 'r');
+  try {
+    const fileSize = (await handle.stat()).size;
+    const length = Math.min(fileSize, maximumBytes);
+    const buffer = Buffer.alloc(length);
+    const start = Math.max(0, fileSize - length);
+    let offset = 0;
+    while (offset < length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        offset,
+        length - offset,
+        start + offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
 export function createLaunchAgentHost(): LaunchAgentHost {
   return {
     openRead: async (path) => {
@@ -114,19 +197,34 @@ export function createLaunchAgentHost(): LaunchAgentHost {
       await mkdir(path, { recursive: true });
     },
     writeFileExclusive: async (path, contents, mode) => {
-      const handle = await open(path, 'wx', mode);
-      try {
-        await handle.writeFile(contents, 'utf8');
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      await writeFileExclusiveAndSync(path, contents, mode);
     },
     link,
     unlink,
     run: runCommand,
     verifyBotUsername: async (token) => (await new Api(token).getMe()).username,
-    readText: async (path) => readFile(path, 'utf8'),
+    readTail,
+  };
+}
+
+export function formatLaunchAgentLogs(logs: LaunchAgentLogs): string {
+  return `stdout (${logs.stdoutPath}):\n${logs.stdout}\n\nstderr (${logs.stderrPath}):\n${logs.stderr}`;
+}
+
+export function toLaunchAgentCompletion(
+  command: Exclude<LaunchAgentCommand, 'status' | 'logs'>,
+  state: LaunchAgentOperationState,
+): {
+  event: 'launch_agent_command_completed';
+  command: Exclude<LaunchAgentCommand, 'status' | 'logs'>;
+  label: string;
+  state: LaunchAgentOperationState;
+} {
+  return {
+    event: 'launch_agent_command_completed',
+    command,
+    label: LAUNCH_AGENT_LABEL,
+    state,
   };
 }
 
@@ -149,6 +247,7 @@ export async function main(): Promise<void> {
     homeDirectory: homedir(),
     repoRoot: process.cwd(),
     nodePath: process.execPath,
+    temporaryFileSuffix: `${process.pid}-${randomUUID()}`,
   });
   const service = new MacosLaunchAgentService({
     host: createLaunchAgentHost(),
@@ -163,17 +262,11 @@ export async function main(): Promise<void> {
   }
   if (command === 'logs') {
     const logs = await service.logs();
-    console.log(`stdout:\n${logs.stdout}\n\nstderr:\n${logs.stderr}`);
+    console.log(formatLaunchAgentLogs(logs));
     return;
   }
-  await service[command]();
-  console.log(
-    JSON.stringify({
-      event: 'launch_agent_command_completed',
-      command,
-      label: LAUNCH_AGENT_LABEL,
-    }),
-  );
+  const state = await service[command]();
+  console.log(JSON.stringify(toLaunchAgentCompletion(command, state)));
 }
 
 if (

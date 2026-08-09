@@ -11,6 +11,7 @@ describe('macOS LaunchAgent plist', () => {
     homeDirectory: '/Users/tatiana',
     repoRoot: '/Applications/Gift & Bot',
     nodePath: '/opt/node/bin/node',
+    temporaryFileSuffix: 'fixture-a',
   });
 
   it('resolves production state outside the checkout', () => {
@@ -31,7 +32,7 @@ describe('macOS LaunchAgent plist', () => {
     expect(paths.plistPath).toBe(
       '/Users/tatiana/Library/LaunchAgents/ru.strelchuk.giveaways-bot.plist',
     );
-    expect(paths.temporaryPlistPath).toBe(`${paths.plistPath}.tmp`);
+    expect(paths.temporaryPlistPath).toBe(`${paths.plistPath}.tmp-fixture-a`);
   });
 
   it('renders escaped absolute paths and no secret keys', () => {
@@ -43,6 +44,10 @@ describe('macOS LaunchAgent plist', () => {
       '<string>/Applications/Gift &amp; Bot/dist/index.js</string>',
     );
     expect(plist).toContain('<key>DOTENV_CONFIG_PATH</key>');
+    expect(plist).toContain('<key>DOTENV_CONFIG_OVERRIDE</key>');
+    expect(plist).toContain(
+      '<key>DOTENV_CONFIG_OVERRIDE</key>\n    <string>true</string>',
+    );
     expect(plist).toContain('<key>RunAtLoad</key>');
     expect(plist).toContain('<key>SuccessfulExit</key>');
     expect(plist).toContain('<integer>30</integer>');
@@ -56,11 +61,32 @@ describe('macOS LaunchAgent plist', () => {
         homeDirectory: `/Users/Tatiana's <Home>`,
         repoRoot: '/Applications/"Gift" & Bot',
         nodePath: '/opt/<node>/bin/node',
+        temporaryFileSuffix: 'fixture-b',
       }),
     );
 
     expect(plist).toContain('/Users/Tatiana&apos;s &lt;Home&gt;/Library');
     expect(plist).toContain('/Applications/&quot;Gift&quot; &amp; Bot');
     expect(plist).toContain('/opt/&lt;node&gt;/bin/node');
+  });
+
+  it('uses a unique safe sibling path for every real installation attempt', () => {
+    const next = resolveLaunchAgentPaths({
+      homeDirectory: '/Users/tatiana',
+      repoRoot: '/Applications/Gift & Bot',
+      nodePath: '/opt/node/bin/node',
+      temporaryFileSuffix: 'fixture-c',
+    });
+
+    expect(next.temporaryPlistPath).not.toBe(paths.temporaryPlistPath);
+    expect(next.temporaryPlistPath).toBe(`${next.plistPath}.tmp-fixture-c`);
+    expect(() =>
+      resolveLaunchAgentPaths({
+        homeDirectory: '/Users/tatiana',
+        repoRoot: '/Applications/Gift & Bot',
+        nodePath: '/opt/node/bin/node',
+        temporaryFileSuffix: '../unsafe',
+      }),
+    ).toThrow('temporary plist suffix');
   });
 });

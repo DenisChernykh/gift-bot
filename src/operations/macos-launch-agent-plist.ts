@@ -23,7 +23,11 @@ export function resolveLaunchAgentPaths(input: {
   homeDirectory: string;
   repoRoot: string;
   nodePath: string;
+  temporaryFileSuffix: string;
 }): LaunchAgentPaths {
+  if (!/^[A-Za-z0-9-]+$/.test(input.temporaryFileSuffix)) {
+    throw new Error('Invalid temporary plist suffix');
+  }
   const applicationSupportDirectory = join(
     input.homeDirectory,
     'Library/Application Support/StrelchukGiveawaysBot',
@@ -50,7 +54,7 @@ export function resolveLaunchAgentPaths(input: {
     stderrPath: join(logsDirectory, 'stderr.log'),
     launchAgentsDirectory: dirname(plistPath),
     plistPath,
-    temporaryPlistPath: `${plistPath}.tmp`,
+    temporaryPlistPath: `${plistPath}.tmp-${input.temporaryFileSuffix}`,
   };
 }
 
@@ -81,6 +85,8 @@ export function renderLaunchAgentPlist(paths: LaunchAgentPaths): string {
   <dict>
     <key>DOTENV_CONFIG_PATH</key>
     <string>${xml(paths.environmentPath)}</string>
+    <key>DOTENV_CONFIG_OVERRIDE</key>
+    <string>true</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

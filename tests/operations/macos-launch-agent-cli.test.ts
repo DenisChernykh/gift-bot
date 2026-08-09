@@ -6,9 +6,13 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   createLaunchAgentHost,
+  formatLaunchAgentLogs,
   parseLaunchAgentCommand,
+  toLaunchAgentCompletion,
   toSafeOperationsFailure,
+  writeFileExclusiveAndSync,
 } from '../../src/operations/macos-launch-agent-cli.js';
+import { MAX_LOG_TAIL_BYTES } from '../../src/operations/macos-launch-agent-service.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -57,6 +61,27 @@ describe('macOS LaunchAgent CLI', () => {
     expect(JSON.stringify(projected)).not.toContain('secret');
   });
 
+  it('formats log contents together with their exact diagnostic paths', () => {
+    const output = formatLaunchAgentLogs({
+      stdoutPath: '/logs/stdout.log',
+      stdout: 'started',
+      stderrPath: '/logs/stderr.log',
+      stderr: 'failed',
+    });
+
+    expect(output).toContain('stdout (/logs/stdout.log):\nstarted');
+    expect(output).toContain('stderr (/logs/stderr.log):\nfailed');
+  });
+
+  it('projects an idempotent lifecycle outcome into safe structured output', () => {
+    expect(toLaunchAgentCompletion('stop', 'already_absent')).toEqual({
+      event: 'launch_agent_command_completed',
+      command: 'stop',
+      label: 'ru.strelchuk.giveaways-bot',
+      state: 'already_absent',
+    });
+  });
+
   it('binds stat and contents to the originally opened file descriptor', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'gift-bot-env-handle-'));
     temporaryDirectories.push(directory);
@@ -88,5 +113,47 @@ describe('macOS LaunchAgent CLI', () => {
     });
 
     await expect(readFile(path, 'utf8')).resolves.toBe('first');
+  });
+
+  it('reads only the bounded suffix of a large log file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'gift-bot-log-tail-'));
+    temporaryDirectories.push(directory);
+    const path = join(directory, 'stdout.log');
+    await writeFile(
+      path,
+      `${'old'.repeat(MAX_LOG_TAIL_BYTES)}${'z'.repeat(MAX_LOG_TAIL_BYTES)}`,
+    );
+
+    const result = await createLaunchAgentHost().readTail(
+      path,
+      MAX_LOG_TAIL_BYTES,
+    );
+
+    expect(Buffer.byteLength(result)).toBe(MAX_LOG_TAIL_BYTES);
+    expect(result).toBe('z'.repeat(MAX_LOG_TAIL_BYTES));
+  });
+
+  it('removes an exclusively created temp file when writing fails', async () => {
+    const events: string[] = [];
+    const failure = new Error('disk write failed');
+
+    await expect(
+      writeFileExclusiveAndSync('/tmp/owned.plist', 'contents', 0o600, {
+        openFile: async () => ({
+          writeFile: async () => {
+            throw failure;
+          },
+          sync: async () => undefined,
+          close: async () => {
+            events.push('close');
+          },
+        }),
+        unlinkFile: async (path) => {
+          events.push(`unlink:${path}`);
+        },
+      }),
+    ).rejects.toBe(failure);
+
+    expect(events).toEqual(['close', 'unlink:/tmp/owned.plist']);
   });
 });

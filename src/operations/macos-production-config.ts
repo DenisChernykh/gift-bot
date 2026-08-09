@@ -51,13 +51,18 @@ export function parseProductionEnvironment(input: {
     throw new Error('LOG_LEVEL must be info or error');
   }
 
+  const teamTelegramIds = parseTeamTelegramIds(required('TEAM_TELEGRAM_IDS'));
+  if (teamTelegramIds.length === 0) {
+    throw new Error('TEAM_TELEGRAM_IDS must contain at least one operator');
+  }
+
   return {
     botToken: required('BOT_TOKEN'),
-    teamTelegramIds: parseTeamTelegramIds(required('TEAM_TELEGRAM_IDS')),
+    teamTelegramIds,
     databasePath,
     logLevel,
     drawMembershipConcurrency: parseDrawMembershipConcurrency(
-      values.DRAW_MEMBERSHIP_CONCURRENCY,
+      required('DRAW_MEMBERSHIP_CONCURRENCY'),
     ),
   };
 }

@@ -57,8 +57,10 @@ describe('production environment preflight', () => {
   it.each([
     ['BOT_TOKEN=1234567890:local_test_value', 'BOT_TOKEN=', 'BOT_TOKEN'],
     ['TEAM_TELEGRAM_IDS=465050746,7607308401', 'TEAM_TELEGRAM_IDS=', 'TEAM_TELEGRAM_IDS'],
+    ['TEAM_TELEGRAM_IDS=465050746,7607308401', 'TEAM_TELEGRAM_IDS=,', 'TEAM_TELEGRAM_IDS'],
     ['LOG_LEVEL=info', 'LOG_LEVEL=debug', 'LOG_LEVEL'],
     ['DRAW_MEMBERSHIP_CONCURRENCY=10', 'DRAW_MEMBERSHIP_CONCURRENCY=0', 'DRAW_MEMBERSHIP_CONCURRENCY'],
+    ['DRAW_MEMBERSHIP_CONCURRENCY=10', 'DRAW_MEMBERSHIP_CONCURRENCY=', 'DRAW_MEMBERSHIP_CONCURRENCY'],
   ])('rejects invalid %s without echoing the token', (from, to, message) => {
     let thrown: unknown;
     try {

@@ -34,7 +34,25 @@ export type LaunchAgentHost = {
   unlink(path: string): Promise<void>;
   run(command: string, args: readonly string[]): Promise<CommandResult>;
   verifyBotUsername(token: string): Promise<string>;
-  readText(path: string): Promise<string>;
+  readTail(path: string, maximumBytes: number): Promise<string>;
+};
+
+export const MAX_LOG_TAIL_BYTES = 64 * 1024;
+
+export type LaunchAgentOperationState =
+  | 'installed'
+  | 'started'
+  | 'already_loaded'
+  | 'stopped'
+  | 'already_absent'
+  | 'restarted'
+  | 'uninstalled';
+
+export type LaunchAgentLogs = {
+  stdoutPath: string;
+  stdout: string;
+  stderrPath: string;
+  stderr: string;
 };
 
 export type LaunchAgentStatus = {
@@ -55,6 +73,17 @@ function hasCode(error: unknown, code: string): boolean {
   return error instanceof Error && 'code' in error && error.code === code;
 }
 
+async function removeOwnedTemporaryFile(
+  host: LaunchAgentHost,
+  path: string,
+): Promise<void> {
+  try {
+    await host.unlink(path);
+  } catch (error) {
+    if (!hasCode(error, 'ENOENT')) throw error;
+  }
+}
+
 export class MacosLaunchAgentService {
   constructor(
     private readonly input: {
@@ -73,7 +102,7 @@ export class MacosLaunchAgentService {
     return `${this.domainTarget}/${LAUNCH_AGENT_LABEL}`;
   }
 
-  async install(): Promise<void> {
+  async install(): Promise<'installed'> {
     const { host, paths } = this.input;
     if (await host.exists(paths.plistPath)) {
       throw new Error('LaunchAgent plist is already installed');
@@ -120,27 +149,38 @@ export class MacosLaunchAgentService {
     await host.mkdir(paths.dataDirectory);
     await host.mkdir(paths.logsDirectory);
     await host.mkdir(paths.launchAgentsDirectory);
-    await host.writeFileExclusive(
-      paths.temporaryPlistPath,
-      renderLaunchAgentPlist(paths),
-      0o600,
-    );
-    const lint = await host.run('plutil', ['-lint', paths.temporaryPlistPath]);
-    if (lint.exitCode !== 0) {
-      await host.unlink(paths.temporaryPlistPath);
-      throw new Error('plutil validation failed');
+    try {
+      await host.writeFileExclusive(
+        paths.temporaryPlistPath,
+        renderLaunchAgentPlist(paths),
+        0o600,
+      );
+    } catch (error) {
+      if (!hasCode(error, 'EEXIST')) {
+        await removeOwnedTemporaryFile(host, paths.temporaryPlistPath);
+      }
+      throw error;
     }
 
     try {
-      await host.link(paths.temporaryPlistPath, paths.plistPath);
-    } catch (error) {
-      await host.unlink(paths.temporaryPlistPath);
-      if (hasCode(error, 'EEXIST')) {
-        throw new Error('LaunchAgent plist is already installed');
+      const lint = await host.run('plutil', [
+        '-lint',
+        paths.temporaryPlistPath,
+      ]);
+      if (lint.exitCode !== 0) {
+        throw new Error('plutil validation failed');
       }
-      throw new Error('LaunchAgent plist publication failed');
+      try {
+        await host.link(paths.temporaryPlistPath, paths.plistPath);
+      } catch (error) {
+        if (hasCode(error, 'EEXIST')) {
+          throw new Error('LaunchAgent plist is already installed');
+        }
+        throw new Error('LaunchAgent plist publication failed');
+      }
+    } finally {
+      await removeOwnedTemporaryFile(host, paths.temporaryPlistPath);
     }
-    await host.unlink(paths.temporaryPlistPath);
     requireSuccess(
       await host.run('launchctl', [
         'bootstrap',
@@ -149,6 +189,7 @@ export class MacosLaunchAgentService {
       ]),
       'launchctl bootstrap',
     );
+    return 'installed';
   }
 
   private async isLoaded(): Promise<boolean> {
@@ -157,11 +198,11 @@ export class MacosLaunchAgentService {
     ).exitCode === 0;
   }
 
-  async start(): Promise<void> {
+  async start(): Promise<'started' | 'already_loaded'> {
     if (!(await this.input.host.exists(this.input.paths.plistPath))) {
       throw new Error('LaunchAgent plist is not installed');
     }
-    if (await this.isLoaded()) return;
+    if (await this.isLoaded()) return 'already_loaded';
     requireSuccess(
       await this.input.host.run('launchctl', [
         'bootstrap',
@@ -170,19 +211,22 @@ export class MacosLaunchAgentService {
       ]),
       'launchctl bootstrap',
     );
+    return 'started';
   }
 
-  async stop(): Promise<void> {
-    if (!(await this.isLoaded())) return;
+  async stop(): Promise<'stopped' | 'already_absent'> {
+    if (!(await this.isLoaded())) return 'already_absent';
     requireSuccess(
       await this.input.host.run('launchctl', ['bootout', this.serviceTarget]),
       'launchctl bootout',
     );
+    return 'stopped';
   }
 
-  async restart(): Promise<void> {
+  async restart(): Promise<'restarted'> {
     await this.stop();
     await this.start();
+    return 'restarted';
   }
 
   async status(): Promise<LaunchAgentStatus> {
@@ -200,7 +244,7 @@ export class MacosLaunchAgentService {
 
   private async tail(path: string): Promise<string> {
     try {
-      return (await this.input.host.readText(path))
+      return (await this.input.host.readTail(path, MAX_LOG_TAIL_BYTES))
         .split('\n')
         .slice(-100)
         .join('\n');
@@ -210,17 +254,23 @@ export class MacosLaunchAgentService {
     }
   }
 
-  async logs(): Promise<{ stdout: string; stderr: string }> {
+  async logs(): Promise<LaunchAgentLogs> {
     return {
+      stdoutPath: this.input.paths.stdoutPath,
       stdout: await this.tail(this.input.paths.stdoutPath),
+      stderrPath: this.input.paths.stderrPath,
       stderr: await this.tail(this.input.paths.stderrPath),
     };
   }
 
-  async uninstall(): Promise<void> {
-    await this.stop();
-    if (await this.input.host.exists(this.input.paths.plistPath)) {
+  async uninstall(): Promise<'uninstalled' | 'already_absent'> {
+    const stopState = await this.stop();
+    const hadPlist = await this.input.host.exists(this.input.paths.plistPath);
+    if (hadPlist) {
       await this.input.host.unlink(this.input.paths.plistPath);
     }
+    return stopState === 'already_absent' && !hadPlist
+      ? 'already_absent'
+      : 'uninstalled';
   }
 }
