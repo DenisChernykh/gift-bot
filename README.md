@@ -76,6 +76,8 @@ LOG_LEVEL=info
 DRAW_MEMBERSHIP_CONCURRENCY=10
 ```
 
+Для `install` все пять значений обязательны, а `TEAM_TELEGRAM_IDS` должен содержать хотя бы одного оператора. LaunchAgent задаёт `DOTENV_CONFIG_OVERRIDE=true`, поэтому именно этот проверенный файл имеет приоритет над одноимёнными переменными, ранее сохранёнными в launchd-domain через `launchctl setenv`.
+
 Перед первой установкой остановите любой ручной `pnpm dev` или `pnpm start` с тем же token. Команда `install` проверяет Node/pnpm, production build, права и содержимое env, точный username `@strelchuk_giveaways_bot`, отсутствие существующего plist и незагруженный service. Только после полного preflight она создаёт каталоги, валидирует plist через `plutil` и выполняет `launchctl bootstrap`:
 
 ```sh
@@ -100,9 +102,11 @@ pnpm ops:launch-agent -- uninstall
 
 `stop` делает `bootout`, поэтому `KeepAlive` не запускает процесс обратно во время обслуживания. `uninstall` удаляет только регистрацию и `~/Library/LaunchAgents/ru.strelchuk.giveaways-bot.plist`; production env, SQLite и логи сохраняются. Команды удаления данных или `purge` нет.
 
+Изменяющие команды выводят безопасное состояние операции, включая `already_loaded` и `already_absent` для идемпотентных повторов. `logs` показывает точные пути и не более последних 100 строк из последних 64 KiB каждого файла; он не загружает растущий лог целиком.
+
 Обновление выполняется явно: `stop` → обновление checkout → `pnpm install` только при изменении lockfile → `pnpm check` → `start` → `status` и `logs`. Автоматических `git pull`, миграционного deployment-runner или самообновления нет; существующие миграции по-прежнему применяет обычный startup `src/index.ts`.
 
-Plist содержит только абсолютные пути, label и `DOTENV_CONFIG_PATH`; token и allowlist в него не записываются. stdout и stderr находятся в `/Users/denischernykh/Library/Logs/StrelchukGiveawaysBot/`. Формат текста `launchctl print` используется только для диагностики и не парсится как стабильный API.
+Plist содержит только абсолютные пути, label, `DOTENV_CONFIG_PATH` и несекретный `DOTENV_CONFIG_OVERRIDE=true`; token и allowlist в него не записываются. stdout и stderr находятся в `/Users/denischernykh/Library/Logs/StrelchukGiveawaysBot/`. Формат текста `launchctl print` используется только для диагностики и не парсится как стабильный API.
 
 ## SQLite и резервная копия
 
