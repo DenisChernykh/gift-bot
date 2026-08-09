@@ -321,7 +321,7 @@ describe('giveaway post synchronization', () => {
     ).toEqual([{ sync_status: 'retrying' }]);
   });
 
-  it('returns a result rendering failure to durable retry instead of leaving it processing', async () => {
+  it('marks a deterministic result rendering failure terminal instead of retrying forever', async () => {
     const { database, service } = await openSynchronization();
     await seedCompletedDraw(database);
     await database.execute(
@@ -335,8 +335,9 @@ describe('giveaway post synchronization', () => {
         "select status, attempts, last_error_kind from sync_tasks where id = 'counter-1'",
       ),
     ).toEqual([
-      { status: 'pending', attempts: 1, last_error_kind: 'unexpected' },
+      { status: 'failed', attempts: 1, last_error_kind: 'result_rendering' },
     ]);
+    expect(await service.synchronizePending()).toBe(0);
   });
 
   it('renders the latest participant count and preserves source entities', async () => {

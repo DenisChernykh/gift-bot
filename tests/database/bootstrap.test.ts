@@ -74,6 +74,11 @@ describe('SQLite bootstrap', () => {
       ).toEqual(
         expect.arrayContaining(['sync_status', 'notification_status']),
       );
+      expect(
+        (await opened.database.all<{ name: string }>(
+          'PRAGMA table_info(draw_runs)',
+        )).map((column) => column.name),
+      ).toContain('failure_context');
     } finally {
       await close?.();
       rmSync(directory, { force: true, recursive: true });

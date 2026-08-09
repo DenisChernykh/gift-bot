@@ -1,7 +1,8 @@
-import type {
-  RerollAuditEntry,
-  RerollRepository,
-  RerollSession,
+import {
+  WinnerNotificationInFlightError,
+  type RerollAuditEntry,
+  type RerollRepository,
+  type RerollSession,
 } from './ports/reroll-repository.js';
 import { TelegramDeliveryError } from './ports/telegram-gateway.js';
 import { advanceReroll } from '../domain/giveaway-draw.js';
@@ -24,6 +25,18 @@ type RerollDependencies = {
   teamTelegramIds: readonly number[];
 };
 
+type RerollCommitInput = {
+  session: RerollSession;
+  previousParticipantId: string;
+  newParticipantId: string | null;
+  skippedCandidates: Array<{
+    participantId: string;
+    reason: 'subscription_missing';
+  }>;
+  cursorBefore: number;
+  cursorAfter: number;
+};
+
 const defaultDependencies: Omit<RerollDependencies, 'teamTelegramIds'> = {
   createId: (kind) => `${kind}-${crypto.randomUUID()}`,
   now: Date.now,
@@ -42,7 +55,8 @@ export type ConfirmRerollResult =
       cursor: number;
       resultRevision: number;
     }
-  | { kind: 'retry_later'; retryAfterMs: number | null };
+  | { kind: 'retry_later'; retryAfterMs: number | null }
+  | { kind: 'notification_in_flight' };
 
 export class GiveawayRerollService {
   readonly #repository: RerollRepository;
@@ -158,7 +172,7 @@ export class GiveawayRerollService {
       });
       cursor = next.cursor;
       if (!next.participantId) {
-        const operation = await this.#commit({
+        const operation = await this.#commitWhenAvailable({
           session,
           previousParticipantId: current.participantId,
           newParticipantId: null,
@@ -166,6 +180,7 @@ export class GiveawayRerollService {
           cursorBefore: draw.cursor,
           cursorAfter: cursor,
         });
+        if (!operation) return { kind: 'notification_in_flight' };
         return { kind: 'completed', ...operation };
       }
       const participant = draw.snapshot.participants.find(
@@ -204,7 +219,7 @@ export class GiveawayRerollService {
             error instanceof TelegramDeliveryError ? error.retryAfterMs : null,
         };
       }
-      const operation = await this.#commit({
+      const operation = await this.#commitWhenAvailable({
         session,
         previousParticipantId: current.participantId,
         newParticipantId: participant.participantId,
@@ -212,21 +227,12 @@ export class GiveawayRerollService {
         cursorBefore: draw.cursor,
         cursorAfter: cursor,
       });
+      if (!operation) return { kind: 'notification_in_flight' };
       return { kind: 'completed', ...operation };
     }
   }
 
-  #commit(input: {
-    session: RerollSession;
-    previousParticipantId: string;
-    newParticipantId: string | null;
-    skippedCandidates: Array<{
-      participantId: string;
-      reason: 'subscription_missing';
-    }>;
-    cursorBefore: number;
-    cursorAfter: number;
-  }) {
+  #commit(input: RerollCommitInput) {
     return this.#repository.commitReroll({
       operationId: this.#dependencies.createId('reroll_operation'),
       sessionId: input.session.id,
@@ -239,6 +245,15 @@ export class GiveawayRerollService {
       teamTelegramIds: this.#dependencies.teamTelegramIds,
       now: this.#dependencies.now(),
     });
+  }
+
+  async #commitWhenAvailable(input: RerollCommitInput) {
+    try {
+      return await this.#commit(input);
+    } catch (error) {
+      if (error instanceof WinnerNotificationInFlightError) return null;
+      throw error;
+    }
   }
 
   async #telegramCall<Result>(operation: () => Promise<Result>): Promise<Result> {

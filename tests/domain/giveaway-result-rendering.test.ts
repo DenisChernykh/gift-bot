@@ -51,6 +51,33 @@ describe('giveaway result rendering', () => {
     expect(rendered.text).not.toContain('причин');
   });
 
+  it('calculates entity offsets from the result line instead of matching the title', () => {
+    const rendered = renderGiveawayResult({
+      title: '1. Боб',
+      kind: 'text',
+      eligibleParticipantCount: 1,
+      places: [
+        {
+          placeNumber: 1,
+          participant: {
+            telegramUserId: 102,
+            username: null,
+            displayName: 'Боб',
+          },
+        },
+      ],
+    });
+
+    expect(rendered.entities).toEqual([
+      {
+        type: 'text_link',
+        offset: rendered.text.lastIndexOf('Боб'),
+        length: 3,
+        url: 'tg://user?id=102',
+      },
+    ]);
+  });
+
   it('states explicitly when no participant was eligible', () => {
     expect(
       renderGiveawayResult({
@@ -92,4 +119,38 @@ describe('giveaway result rendering', () => {
       }),
     ).toThrow('Telegram length');
   });
+
+  it.each([
+    ['text', 4_096],
+    ['photo', 1_024],
+  ] as const)(
+    'keeps every one of 50 valid places inside the Telegram %s limit',
+    (kind, maximumLength) => {
+      const rendered = renderGiveawayResult({
+        title: 'П'.repeat(100),
+        kind,
+        eligibleParticipantCount: 50,
+        places: Array.from({ length: 50 }, (_, index) => ({
+          placeNumber: index + 1,
+          participant: {
+            telegramUserId: 10_000 + index,
+            username: index % 2 === 0 ? `user_${'x'.repeat(25)}${index}` : null,
+            displayName: `${'Очень длинное имя '.repeat(7)}${index}`,
+          },
+        })),
+      });
+
+      expect(rendered.text.length).toBeLessThanOrEqual(maximumLength);
+      for (let placeNumber = 1; placeNumber <= 50; placeNumber += 1) {
+        expect(rendered.text).toContain(`${placeNumber}. `);
+      }
+      expect(rendered.entities).toHaveLength(50);
+      for (const entity of rendered.entities) {
+        expect(entity.url).toMatch(/^tg:\/\/user\?id=\d+$/);
+        expect(
+          rendered.text.slice(entity.offset, entity.offset + entity.length),
+        ).not.toHaveLength(0);
+      }
+    },
+  );
 });

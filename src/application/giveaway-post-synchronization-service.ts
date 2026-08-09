@@ -6,6 +6,7 @@ import {
   TelegramDeliveryError,
   type TelegramPostEdit,
 } from './ports/telegram-gateway.js';
+import { GiveawayResultRenderingError } from '../domain/giveaway-result-rendering.js';
 
 type PostEditGateway = {
   editGiveawayPost(input: TelegramPostEdit): Promise<void>;
@@ -115,6 +116,7 @@ export class GiveawayPostSynchronizationService {
     await this.#repository.failTask({
       id: task.id,
       errorKind: classified.errorKind,
+      terminal: classified.terminal,
       availableAt: failedAt + delay,
       now: failedAt,
     });
@@ -124,12 +126,21 @@ export class GiveawayPostSynchronizationService {
 function classifySynchronizationError(error: unknown): {
   errorKind: string;
   retryAfterMs: number | null;
+  terminal: boolean;
 } {
+  if (error instanceof GiveawayResultRenderingError) {
+    return {
+      errorKind: 'result_rendering',
+      retryAfterMs: null,
+      terminal: true,
+    };
+  }
   if (error instanceof TelegramDeliveryError) {
     return {
       errorKind: `telegram_${error.outcome}`,
       retryAfterMs: error.retryAfterMs,
+      terminal: false,
     };
   }
-  return { errorKind: 'unexpected', retryAfterMs: null };
+  return { errorKind: 'unexpected', retryAfterMs: null, terminal: false };
 }

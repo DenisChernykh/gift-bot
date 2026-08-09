@@ -310,6 +310,7 @@ export const drawRuns = sqliteTable(
     resultRevision: integer('result_revision').notNull().default(0),
     failureStage: text('failure_stage'),
     failureErrorKind: text('failure_error_kind'),
+    failureContext: text('failure_context'),
     startedAt: integer('started_at').notNull(),
     snapshotCreatedAt: integer('snapshot_created_at'),
     completedAt: integer('completed_at'),

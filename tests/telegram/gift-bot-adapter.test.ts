@@ -1030,6 +1030,14 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
       'Health card — active\nУчастников: 1\nРефералы: включены\nСинхронизация: ожидает синхронизации\n⚠️ Бот не администратор @health_channel («Health Channel»).',
     );
+
+    await database.execute(
+      "update sync_tasks set status = 'failed' where id = 'health-sync'",
+    );
+    await bot.handleUpdate(privateMessageUpdate(76, 700, '/giveaways'));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toBe(
+      'Health card — active\nУчастников: 1\nРефералы: включены\nСинхронизация: ошибка синхронизации\n⚠️ Бот не администратор @health_channel («Health Channel»).',
+    );
   });
 
   it('lists giveaways and confirms /cancel before synchronizing an active post', async () => {
@@ -1152,7 +1160,7 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       fakeApi,
       telegramGateway,
       drawRepository,
-    } = await openTestBot();
+    } = await openTestBot([700, 701]);
     await database.execute(
       `insert into giveaways (
          id, title, state, winner_count, deadline_utc, referrals_enabled,
@@ -1253,7 +1261,25 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     );
     const confirmation = fakeApi.sentMessages().at(-1)!;
     const confirm = callbackData(confirmation, 'Подтвердить перевыбор');
+    await database.execute(
+      `update draw_notifications set status = 'processing'
+        where giveaway_id = 'reroll-gift' and kind = 'winner'
+          and recipient_telegram_id = 101`,
+    );
     await bot.handleUpdate(callbackUpdate(123, 700, confirm));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'уведомление прежнему победителю',
+    );
+    expect(
+      await database.all(
+        "select count(*) as count from reroll_operations where draw_run_id = (select id from draw_runs where giveaway_id = 'reroll-gift')",
+      ),
+    ).toEqual([{ count: 0 }]);
+    await database.execute(
+      `update draw_notifications set status = 'delivered'
+        where giveaway_id = 'reroll-gift' and kind = 'winner'
+          and recipient_telegram_id = 101`,
+    );
     await bot.handleUpdate(callbackUpdate(124, 700, confirm));
 
     expect(
@@ -1302,7 +1328,7 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
           order by recipient_telegram_id`,
       ),
     ).toEqual([
-      { recipient_telegram_id: 101, status: 'superseded' },
+      { recipient_telegram_id: 101, status: 'delivered' },
       { recipient_telegram_id: 102, status: 'pending' },
       { recipient_telegram_id: 104, status: 'superseded' },
     ]);
@@ -1326,13 +1352,40 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
            order by id limit 1
         )`,
     );
+    await database.execute(
+      `update reroll_operations set skipped_candidates = ?
+        where draw_run_id = (
+          select id from draw_runs where giveaway_id = 'reroll-gift'
+        ) and result_revision = 2`,
+      [
+        JSON.stringify(
+          Array.from({ length: 130 }, () => ({
+            participantId: 'carol',
+            reason: 'subscription_missing',
+          })),
+        ),
+      ],
+    );
 
     await bot.handleUpdate(privateMessageUpdate(129, 700, '/giveaways'));
     const finalCard = fakeApi.sentMessages().at(-1)!;
     expect(finalCard.payload.text).toContain('не доставлено 1');
     const audit = callbackData(finalCard, 'История перевыборов');
     await bot.handleUpdate(callbackUpdate(130, 700, audit));
-    const auditText = String(fakeApi.sentMessages().at(-1)!.payload.text);
+    const firstAuditPage = fakeApi.sentMessages().at(-1)!;
+    expect(String(firstAuditPage.payload.text).length).toBeLessThanOrEqual(4_096);
+    expect(firstAuditPage.payload.text).toContain('страница 1/2');
+    const nextAuditPage = callbackData(firstAuditPage, 'Следующая');
+    const sentBeforeForeignClick = fakeApi.sentMessages().length;
+    await bot.handleUpdate(callbackUpdate(131, 701, nextAuditPage));
+    expect(fakeApi.sentMessages()).toHaveLength(sentBeforeForeignClick);
+    await bot.handleUpdate(callbackUpdate(132, 700, nextAuditPage));
+    const secondAuditPage = fakeApi.sentMessages().at(-1)!;
+    expect(String(secondAuditPage.payload.text).length).toBeLessThanOrEqual(
+      4_096,
+    );
+    expect(secondAuditPage.payload.text).toContain('страница 2/2');
+    const auditText = `${firstAuditPage.payload.text}\n${secondAuditPage.payload.text}`;
     expect(auditText).toContain('Причина: bot_or_suspicious_account');
     expect(auditText).toContain('@alice → @dave');
     expect(auditText).toContain('@carol: subscription_missing');
@@ -1390,6 +1443,12 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       giveawayId: 'retry-draw',
       stage: 'final_eligibility',
       errorKind: 'telegram_network',
+      channel: {
+        id: 'retry-channel',
+        telegramChatId: -8001,
+        username: 'retry_channel',
+        title: 'Retry Channel',
+      },
       teamTelegramIds: [700],
       now: NOW,
     });
@@ -1398,11 +1457,33 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
     await bot.handleUpdate(privateMessageUpdate(130, 700, '/giveaways'));
     const card = fakeApi.sentMessages().at(-1)!;
     expect(card.payload.text).toContain('ошибка: telegram_network');
+    expect(card.payload.text).toContain(
+      '@retry_channel (ID retry-channel, chat -8001)',
+    );
     const retry = callbackData(card, 'Повторить завершение');
     await bot.handleUpdate(callbackUpdate(131, 701, retry));
     expect(await database.all("select state from giveaways where id = 'retry-draw'"))
       .toEqual([{ state: 'failed' }]);
+    await database.execute(
+      `update draw_notifications set status = 'processing'
+        where giveaway_id = 'retry-draw' and kind = 'team_failure'`,
+    );
     await bot.handleUpdate(callbackUpdate(132, 700, retry));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'Уведомление об ошибке ещё отправляется',
+    );
+    expect(await database.all("select state from giveaways where id = 'retry-draw'"))
+      .toEqual([{ state: 'failed' }]);
+    await database.execute(
+      `update draw_notifications set status = 'delivered'
+        where giveaway_id = 'retry-draw' and kind = 'team_failure'`,
+    );
+    await bot.handleUpdate(privateMessageUpdate(133, 700, '/giveaways'));
+    const retryAfterDelivery = callbackData(
+      fakeApi.sentMessages().at(-1)!,
+      'Повторить завершение',
+    );
+    await bot.handleUpdate(callbackUpdate(134, 700, retryAfterDelivery));
     expect(await database.all("select state from giveaways where id = 'retry-draw'"))
       .toEqual([{ state: 'completed' }]);
   });

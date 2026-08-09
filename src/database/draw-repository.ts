@@ -1,6 +1,7 @@
 import type {
   CompletedDraw,
   CurrentDrawPlace,
+  DrawChannel,
   DrawRepository,
   DrawTarget,
 } from '../application/ports/draw-repository.js';
@@ -8,12 +9,13 @@ import type {
   DrawNotification,
   DrawNotificationRepository,
 } from '../application/ports/draw-notification-repository.js';
-import type {
-  RerollAuditEntry,
-  RerollContext,
-  RerollRepository,
-  RerollResult,
-  RerollSession,
+import {
+  WinnerNotificationInFlightError,
+  type RerollAuditEntry,
+  type RerollContext,
+  type RerollRepository,
+  type RerollResult,
+  type RerollSession,
 } from '../application/ports/reroll-repository.js';
 import {
   selectInitialWinners,
@@ -198,9 +200,10 @@ export class SqliteDrawRepository
         );
       }
       await transaction.execute(
-        `update draw_runs
+          `update draw_runs
             set cursor = ?, result_revision = 1, completed_at = ?,
-                failure_stage = null, failure_error_kind = null, updated_at = ?
+                failure_stage = null, failure_error_kind = null,
+                failure_context = null, updated_at = ?
           where id = ?`,
         [input.cursor, input.now, input.now, row.drawRunId],
       );
@@ -225,7 +228,7 @@ export class SqliteDrawRepository
       await transaction.execute(
         `update draw_notifications set status = 'superseded', updated_at = ?
           where giveaway_id = ? and kind = 'team_failure'
-            and status in ('pending', 'processing')`,
+            and status = 'pending'`,
         [input.now, input.giveawayId],
       );
       await this.#queueResultSynchronization(
@@ -234,35 +237,38 @@ export class SqliteDrawRepository
         1,
         input.now,
       );
+      const title = await this.#giveawayTitle(transaction, input.giveawayId);
+      const participantById = new Map(
+        snapshot.participants.map((participant) => [
+          participant.participantId,
+          participant,
+        ]),
+      );
+      const placeLines = input.places.map((place) => {
+        const participant = place.participantId
+          ? participantById.get(place.participantId)
+          : null;
+        return participant
+          ? `${place.placeNumber}. ${participant.displayName} (Telegram ID ${participant.telegramUserId}; рефералов ${participant.validDirectReferralCount}; билетов ${participant.ticketCount})`
+          : `${place.placeNumber}. Место не заполнено`;
+      });
+      const teamResultMessages = createTeamResultMessages({
+        title,
+        participantCount: snapshot.participants.length,
+        ticketCount: snapshot.ticketOrder.length,
+        placeLines,
+      });
       for (const recipientTelegramId of new Set(input.teamTelegramIds)) {
-        const participantById = new Map(
-          snapshot.participants.map((participant) => [
-            participant.participantId,
-            participant,
-          ]),
-        );
-        const placeLines = input.places.map((place) => {
-          const participant = place.participantId
-            ? participantById.get(place.participantId)
-            : null;
-          return participant
-            ? `${place.placeNumber}. ${participant.displayName} (Telegram ID ${participant.telegramUserId}; рефералов ${participant.validDirectReferralCount}; билетов ${participant.ticketCount})`
-            : `${place.placeNumber}. Место не заполнено`;
-        });
-        await this.#insertNotification(transaction, {
-          giveawayId: input.giveawayId,
-          drawRunId: row.drawRunId,
-          recipientTelegramId,
-          kind: 'team_result',
-          payload: JSON.stringify({
-            text: [
-              `Результат розыгрыша «${await this.#giveawayTitle(transaction, input.giveawayId)}» зафиксирован; публичная синхронизация запущена.`,
-              `Допущено участников: ${snapshot.participants.length}. Билетов: ${snapshot.ticketOrder.length}.`,
-              ...placeLines,
-            ].join('\n'),
-          }),
-          now: input.now,
-        });
+        for (const text of teamResultMessages) {
+          await this.#insertNotification(transaction, {
+            giveawayId: input.giveawayId,
+            drawRunId: row.drawRunId,
+            recipientTelegramId,
+            kind: 'team_result',
+            payload: JSON.stringify({ text }),
+            now: input.now,
+          });
+        }
       }
       const byId = new Map(
         snapshot.participants.map((participant) => [
@@ -279,7 +285,7 @@ export class SqliteDrawRepository
           recipientTelegramId: participant.telegramUserId,
           kind: 'winner',
           payload: JSON.stringify({
-            text: `Вы стали победителем розыгрыша «${await this.#giveawayTitle(transaction, input.giveawayId)}». Ваше место: ${place.placeNumber}.`,
+            text: `Вы стали победителем розыгрыша «${title}». Ваше место: ${place.placeNumber}.`,
           }),
           now: input.now,
         });
@@ -294,6 +300,7 @@ export class SqliteDrawRepository
     giveawayId: string;
     stage: string;
     errorKind: string;
+    channel?: DrawChannel;
     teamTelegramIds: readonly number[];
     now: number;
   }): Promise<void> {
@@ -312,9 +319,18 @@ export class SqliteDrawRepository
       );
       await transaction.execute(
         `update draw_runs set failure_stage = ?, failure_error_kind = ?,
-                              updated_at = ? where id = ?`,
-        [input.stage, input.errorKind, input.now, row.drawRunId],
+                              failure_context = ?, updated_at = ? where id = ?`,
+        [
+          input.stage,
+          input.errorKind,
+          input.channel ? JSON.stringify({ channel: input.channel }) : null,
+          input.now,
+          row.drawRunId,
+        ],
       );
+      const channelContext = input.channel
+        ? ` Канал: @${input.channel.username} (ID ${input.channel.id}; chat ${input.channel.telegramChatId}).`
+        : '';
       for (const recipientTelegramId of new Set(input.teamTelegramIds)) {
         await this.#insertNotification(transaction, {
           giveawayId: input.giveawayId,
@@ -322,7 +338,7 @@ export class SqliteDrawRepository
           recipientTelegramId,
           kind: 'team_failure',
           payload: JSON.stringify({
-            text: `Завершение розыгрыша «${await this.#giveawayTitle(transaction, input.giveawayId)}» остановлено. Этап: ${input.stage}; ошибка: ${input.errorKind}. После устранения причины используйте ручной retry.`,
+            text: `Завершение розыгрыша «${await this.#giveawayTitle(transaction, input.giveawayId)}» остановлено. Этап: ${input.stage}; ошибка: ${input.errorKind}.${channelContext} После устранения причины используйте ручной retry.`,
           }),
           now: input.now,
         });
@@ -344,13 +360,26 @@ export class SqliteDrawRepository
       );
       const row = rows[0];
       if (!row || row.state !== 'failed' || !row.failureStage) return false;
+      const inFlight = await transaction.all<{ id: string }>(
+        `select id from draw_notifications
+          where giveaway_id = ? and kind = 'team_failure'
+            and status = 'processing' limit 1`,
+        [giveawayId],
+      );
+      if (inFlight[0]) return false;
+      await transaction.execute(
+        `update draw_notifications set status = 'superseded', updated_at = ?
+          where giveaway_id = ? and kind = 'team_failure'
+            and status = 'pending'`,
+        [now, giveawayId],
+      );
       await transaction.execute(
         "update giveaways set state = 'drawing', updated_at = ? where id = ? and state = 'failed'",
         [now, giveawayId],
       );
       await transaction.execute(
         `update draw_runs set failure_stage = null, failure_error_kind = null,
-                              updated_at = ? where id = ?`,
+                              failure_context = null, updated_at = ? where id = ?`,
         [now, row.drawRunId],
       );
       return true;
@@ -609,6 +638,15 @@ export class SqliteDrawRepository
       const previousParticipant = participants.get(
         input.previousParticipantId,
       )!;
+      const notificationInFlight = await transaction.all<{ id: string }>(
+        `select id from draw_notifications
+          where giveaway_id = ? and recipient_telegram_id = ?
+            and kind = 'winner' and status = 'processing' limit 1`,
+        [session.giveawayId, previousParticipant.telegramUserId],
+      );
+      if (notificationInFlight[0]) {
+        throw new WinnerNotificationInFlightError();
+      }
       const newParticipant = input.newParticipantId
         ? participants.get(input.newParticipantId)!
         : null;
@@ -1193,13 +1231,13 @@ export class SqliteDrawRepository
       `select distinct reroll_operation_id as operationId
          from draw_notifications
         where giveaway_id = ? and recipient_telegram_id = ?
-          and kind = 'winner' and status in ('pending', 'processing')`,
+          and kind = 'winner' and status = 'pending'`,
       [giveawayId, recipientTelegramId],
     );
     await transaction.execute(
       `update draw_notifications set status = 'superseded', updated_at = ?
         where giveaway_id = ? and recipient_telegram_id = ?
-          and kind = 'winner' and status in ('pending', 'processing')`,
+          and kind = 'winner' and status = 'pending'`,
       [now, giveawayId, recipientTelegramId],
     );
     for (const operation of operations) {
@@ -1311,6 +1349,62 @@ function resultOperationId(payload: string): string | null {
   } catch {
     return null;
   }
+}
+
+function createTeamResultMessages(input: {
+  title: string;
+  participantCount: number;
+  ticketCount: number;
+  placeLines: string[];
+}): string[] {
+  const header = [
+    `Результат розыгрыша «${input.title}» зафиксирован; публичная синхронизация запущена.`,
+    `Допущено участников: ${input.participantCount}. Билетов: ${input.ticketCount}.`,
+  ];
+  const maximumPartMarker = 'Часть 9999/9999.';
+  const contentLimit =
+    4_096 - header.join('\n').length - maximumPartMarker.length - 2;
+  if (contentLimit < 1) {
+    throw new Error('Team result header exceeds the Telegram length limit');
+  }
+  const chunks = chunkTelegramLines(input.placeLines, contentLimit);
+  if (chunks.length === 1) return [[...header, ...chunks[0]!].join('\n')];
+  return chunks.map((lines, index) =>
+    [...header, `Часть ${index + 1}/${chunks.length}.`, ...lines].join('\n'),
+  );
+}
+
+function chunkTelegramLines(lines: string[], maximumLength: number): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let currentLength = 0;
+  for (const line of lines.flatMap((value) => splitTelegramLine(value, maximumLength))) {
+    const nextLength = currentLength + (current.length === 0 ? 0 : 1) + line.length;
+    if (current.length > 0 && nextLength > maximumLength) {
+      chunks.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(line);
+    currentLength += (current.length === 1 ? 0 : 1) + line.length;
+  }
+  if (current.length > 0 || chunks.length === 0) chunks.push(current);
+  return chunks;
+}
+
+function splitTelegramLine(line: string, maximumLength: number): string[] {
+  if (line.length <= maximumLength) return [line];
+  const parts: string[] = [];
+  let current = '';
+  for (const character of line) {
+    if (current.length + character.length > maximumLength) {
+      parts.push(current);
+      current = '';
+    }
+    current += character;
+  }
+  if (current) parts.push(current);
+  return parts;
 }
 
 function assertRerollProgressMatchesSnapshot(input: {

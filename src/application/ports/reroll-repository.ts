@@ -1,5 +1,12 @@
 import type { CompletedDraw, DrawChannel } from './draw-repository.js';
 
+export class WinnerNotificationInFlightError extends Error {
+  constructor() {
+    super('Winner notification is being delivered');
+    this.name = 'WinnerNotificationInFlightError';
+  }
+}
+
 export type RerollSession = {
   id: string;
   giveawayId: string;

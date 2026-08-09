@@ -6,6 +6,22 @@ type ResultParticipant = {
   displayName: string;
 };
 
+type ResultLine = {
+  text: string;
+  link?: {
+    offset: number;
+    length: number;
+    telegramUserId: number;
+  };
+};
+
+export class GiveawayResultRenderingError extends Error {
+  constructor() {
+    super('Giveaway result exceeds the Telegram length limit');
+    this.name = 'GiveawayResultRenderingError';
+  }
+}
+
 export function renderGiveawayResult(input: {
   title: string;
   kind: 'text' | 'photo';
@@ -15,36 +31,68 @@ export function renderGiveawayResult(input: {
     participant: ResultParticipant | null;
   }>;
 }): { text: string; entities: GiveawayMessageEntity[] } {
-  const lines = [input.title, '', 'Итоги:'];
-  if (input.eligibleParticipantCount === 0) {
-    lines.push('Подходящих участников нет.');
+  const maximumLength = input.kind === 'text' ? 4_096 : 1_024;
+  let lines = resultLines(input, false);
+  let text = lines.map((line) => line.text).join('\n');
+  if (text.length > maximumLength) {
+    lines = resultLines(input, true);
+    text = lines.map((line) => line.text).join('\n');
   }
-  const linkedNames: Array<{ marker: string; participant: ResultParticipant }> = [];
+  if (text.length > maximumLength) {
+    throw new GiveawayResultRenderingError();
+  }
+
+  const entities: GiveawayMessageEntity[] = [];
+  let lineOffset = 0;
+  for (const line of lines) {
+    if (line.link) {
+      entities.push({
+        type: 'text_link',
+        offset: lineOffset + line.link.offset,
+        length: line.link.length,
+        url: `tg://user?id=${line.link.telegramUserId}`,
+      });
+    }
+    lineOffset += line.text.length + 1;
+  }
+  return { text, entities };
+}
+
+function resultLines(
+  input: Parameters<typeof renderGiveawayResult>[0],
+  compact: boolean,
+): ResultLine[] {
+  const lines: ResultLine[] = [
+    { text: input.title },
+    { text: '' },
+    { text: 'Итоги:' },
+  ];
+  if (input.eligibleParticipantCount === 0) {
+    lines.push({ text: 'Подходящих участников нет.' });
+  }
   for (const place of input.places) {
     if (!place.participant) {
-      lines.push(`${place.placeNumber}. Место не заполнено`);
+      lines.push({ text: `${place.placeNumber}. Место не заполнено` });
       continue;
     }
-    if (place.participant.username) {
-      lines.push(`${place.placeNumber}. @${place.participant.username}`);
-      continue;
-    }
-    const marker = `${place.placeNumber}. ${place.participant.displayName}`;
-    lines.push(marker);
-    linkedNames.push({ marker, participant: place.participant });
+    const prefix = `${place.placeNumber}. `;
+    const preferredLabel = place.participant.username
+      ? `@${place.participant.username}`
+      : place.participant.displayName;
+    const label = compact ? 'Участник' : preferredLabel;
+    const shouldLink = compact || !place.participant.username;
+    lines.push({
+      text: `${prefix}${label}`,
+      ...(shouldLink
+        ? {
+            link: {
+              offset: prefix.length,
+              length: label.length,
+              telegramUserId: place.participant.telegramUserId,
+            },
+          }
+        : {}),
+    });
   }
-  const text = lines.join('\n');
-  const maximumLength = input.kind === 'text' ? 4096 : 1024;
-  if (text.length > maximumLength) {
-    throw new Error('Giveaway result exceeds the Telegram length limit');
-  }
-  const entities: GiveawayMessageEntity[] = linkedNames.map(
-    ({ marker, participant }) => ({
-      type: 'text_link',
-      offset: text.indexOf(marker) + marker.length - participant.displayName.length,
-      length: participant.displayName.length,
-      url: `tg://user?id=${participant.telegramUserId}`,
-    }),
-  );
-  return { text, entities };
+  return lines;
 }

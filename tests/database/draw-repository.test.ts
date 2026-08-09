@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { DrawNotificationService } from '../../src/application/draw-notification-service.js';
 import { openDatabase } from '../../src/database/client.js';
 import { SqliteDrawRepository } from '../../src/database/draw-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
@@ -239,6 +240,60 @@ describe('SqliteDrawRepository', () => {
     ]);
   });
 
+  it('chunks the private 50-place team result within Telegram message limits', async () => {
+    const { database, repository } = await openDrawDatabase();
+    await seedGiveaway(database, 'maximum');
+    await repository.claimNextDue(NOW);
+    const participants = Array.from({ length: 50 }, (_, index) => ({
+      participantId: `participant-${index + 1}`,
+      telegramUserId: 10_000 + index,
+      username: null,
+      displayName: `${'Очень длинное имя победителя '.repeat(5)}${index + 1}`,
+      inviterParticipantId: null,
+      validDirectReferralCount: index,
+      ticketCount: index + 1,
+    }));
+    const maximumSnapshot: DrawSnapshot = {
+      version: 1,
+      createdAt: NOW,
+      winnerCount: 50,
+      participants,
+      ticketOrder: participants.map((participant) => participant.participantId),
+    };
+    await repository.saveSnapshot({
+      giveawayId: 'maximum',
+      snapshot: maximumSnapshot,
+      now: NOW,
+    });
+    await repository.completeDraw({
+      giveawayId: 'maximum',
+      places: participants.map((participant, index) => ({
+        placeNumber: index + 1,
+        status: 'selected' as const,
+        participantId: participant.participantId,
+      })),
+      cursor: 50,
+      teamTelegramIds: [700],
+      now: NOW + 1,
+    });
+
+    const rows = await database.all<{ payload: string }>(
+      `select payload from draw_notifications
+        where giveaway_id = 'maximum' and kind = 'team_result'
+        order by created_at, id`,
+    );
+    const texts = rows.map(
+      (row) => (JSON.parse(row.payload) as { text: string }).text,
+    );
+    expect(texts.length).toBeGreaterThan(1);
+    expect(texts.every((text) => text.length <= 4_096)).toBe(true);
+    expect(
+      texts.flatMap((text) =>
+        [...text.matchAll(/^(\d+)\. /gm)].map((match) => Number(match[1])),
+      ),
+    ).toEqual(Array.from({ length: 50 }, (_, index) => index + 1));
+  });
+
   it('rejects an initial result that does not match the immutable ticket order', async () => {
     const { database, repository } = await openDrawDatabase();
     await seedGiveaway(database, 'one');
@@ -275,9 +330,22 @@ describe('SqliteDrawRepository', () => {
       giveawayId: 'one',
       stage: 'final_eligibility',
       errorKind: 'telegram_unknown',
+      channel: {
+        id: 'channel-one',
+        telegramChatId: -1001,
+        username: 'channel_one',
+        title: 'Channel One',
+      },
       teamTelegramIds: [700],
       now: NOW + 1,
     });
+
+    const failureNotification = await database.all<{ payload: string }>(
+      "select payload from draw_notifications where giveaway_id = 'one' and kind = 'team_failure'",
+    );
+    expect(
+      (JSON.parse(failureNotification[0]!.payload) as { text: string }).text,
+    ).toContain('@channel_one (ID channel-one; chat -1001)');
 
     expect(await repository.listDrawing()).toEqual([]);
     expect(await repository.retryFailedDraw('one', NOW + 2)).toBe(true);
@@ -285,9 +353,15 @@ describe('SqliteDrawRepository', () => {
     expect((await repository.getDrawing('one'))?.snapshot).toBeNull();
     expect(
       await database.all(
-        "select failure_stage, failure_error_kind from draw_runs where giveaway_id = 'one'",
+        "select failure_stage, failure_error_kind, failure_context from draw_runs where giveaway_id = 'one'",
       ),
-    ).toEqual([{ failure_stage: null, failure_error_kind: null }]);
+    ).toEqual([
+      {
+        failure_stage: null,
+        failure_error_kind: null,
+        failure_context: null,
+      },
+    ]);
     await repository.saveSnapshot({
       giveawayId: 'one',
       snapshot: snapshot('one'),
@@ -308,6 +382,51 @@ describe('SqliteDrawRepository', () => {
         "select status from draw_notifications where giveaway_id = 'one' and kind = 'team_failure'",
       ),
     ).toEqual([{ status: 'superseded' }]);
+  });
+
+  it('does not retry a failed draw while its team failure notification is being sent', async () => {
+    const { database, repository } = await openDrawDatabase();
+    await seedGiveaway(database, 'one');
+    await repository.claimNextDue(NOW);
+    await repository.failDraw({
+      giveawayId: 'one',
+      stage: 'final_eligibility',
+      errorKind: 'telegram_network',
+      teamTelegramIds: [700],
+      now: NOW + 1,
+    });
+    let releaseSend!: () => void;
+    let markSendStarted!: () => void;
+    const sendStarted = new Promise<void>((resolve) => {
+      markSendStarted = resolve;
+    });
+    const service = new DrawNotificationService(
+      repository,
+      {
+        sendDirectMessage: async () => {
+          markSendStarted();
+          await new Promise<void>((resolve) => {
+            releaseSend = resolve;
+          });
+        },
+      },
+      { now: () => NOW + 2 },
+    );
+
+    const delivery = service.deliverPending();
+    await sendStarted;
+    expect(await repository.retryFailedDraw('one', NOW + 3)).toBe(false);
+    expect(await database.all("select state from giveaways where id = 'one'"))
+      .toEqual([{ state: 'failed' }]);
+
+    releaseSend();
+    await delivery;
+    expect(await repository.retryFailedDraw('one', NOW + 4)).toBe(true);
+    expect(
+      await database.all(
+        "select status from draw_notifications where giveaway_id = 'one' and kind = 'team_failure'",
+      ),
+    ).toEqual([{ status: 'delivered' }]);
   });
 
   it('rerolls one occupied place atomically and replays the saved operation', async () => {
@@ -455,6 +574,85 @@ describe('SqliteDrawRepository', () => {
     expect(await repository.listRerollAudit('one')).toEqual([
       expect.objectContaining({ notificationStatus: 'partial_failure' }),
     ]);
+  });
+
+  it('does not replace a winner while that winner notification is being sent', async () => {
+    const { database, repository } = await openDrawDatabase();
+    await seedGiveaway(database, 'one');
+    await repository.claimNextDue(NOW);
+    await repository.saveSnapshot({
+      giveawayId: 'one',
+      snapshot: snapshot('one'),
+      now: NOW,
+    });
+    await repository.completeDraw({
+      giveawayId: 'one',
+      places: [
+        { placeNumber: 1, status: 'selected', participantId: 'alice-one' },
+        { placeNumber: 2, status: 'selected', participantId: 'bob-one' },
+      ],
+      cursor: 2,
+      teamTelegramIds: [700],
+      now: NOW + 1,
+    });
+    const session = await repository.startRerollSession({
+      id: 'session-race',
+      giveawayId: 'one',
+      placeNumber: 1,
+      operatorTelegramId: 700,
+      now: NOW + 2,
+    });
+    await repository.saveRerollReason({
+      sessionId: session.id,
+      operatorTelegramId: 700,
+      reason: 'manual_review',
+      now: NOW + 3,
+    });
+    let releaseWinner!: () => void;
+    let markWinnerStarted!: () => void;
+    const winnerStarted = new Promise<void>((resolve) => {
+      markWinnerStarted = resolve;
+    });
+    const notifications = new DrawNotificationService(
+      repository,
+      {
+        sendDirectMessage: async (chatId) => {
+          if (chatId !== 101) return;
+          markWinnerStarted();
+          await new Promise<void>((resolve) => {
+            releaseWinner = resolve;
+          });
+        },
+      },
+      { now: () => NOW + 4 },
+    );
+    const delivery = notifications.deliverPending();
+    await winnerStarted;
+    const reroll = {
+      operationId: 'operation-race',
+      sessionId: session.id,
+      operatorTelegramId: 700,
+      previousParticipantId: 'alice-one',
+      newParticipantId: 'carol-one',
+      skippedCandidates: [],
+      cursorBefore: 2,
+      cursorAfter: 3,
+      teamTelegramIds: [700],
+      now: NOW + 5,
+    } as const;
+
+    await expect(repository.commitReroll(reroll)).rejects.toThrow(
+      'notification is being delivered',
+    );
+    expect((await repository.getCompletedDraw('one'))?.places[0]).toEqual(
+      expect.objectContaining({ participantId: 'alice-one', version: 1 }),
+    );
+
+    releaseWinner();
+    await delivery;
+    await expect(repository.commitReroll(reroll)).resolves.toEqual(
+      expect.objectContaining({ newParticipantId: 'carol-one' }),
+    );
   });
 
   it('exposes skipped candidate identities and reasons in the private reroll audit', async () => {

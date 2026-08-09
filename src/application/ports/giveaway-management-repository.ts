@@ -14,7 +14,7 @@ export type GiveawayListItem = {
   updatedAt: number;
   participantCount: number;
   referralsEnabled: boolean;
-  synchronizationState: 'up_to_date' | 'pending' | 'processing';
+  synchronizationState: 'up_to_date' | 'pending' | 'processing' | 'failed';
   warnings: Array<{
     channelId: string;
     username: string;
@@ -28,6 +28,12 @@ export type GiveawayListItem = {
   drawFailure?: {
     stage: string;
     errorKind: string;
+    channel?: {
+      id: string;
+      telegramChatId: number;
+      username: string;
+      title: string;
+    };
   };
   notificationDelivery?: {
     pendingCount: number;

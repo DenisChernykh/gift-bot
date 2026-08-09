@@ -59,6 +59,7 @@ export interface DrawRepository {
     giveawayId: string;
     stage: string;
     errorKind: string;
+    channel?: DrawChannel;
     teamTelegramIds: readonly number[];
     now: number;
   }): Promise<void>;

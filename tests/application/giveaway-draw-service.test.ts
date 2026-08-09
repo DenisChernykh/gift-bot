@@ -4,6 +4,7 @@ import { GiveawayDrawService } from '../../src/application/giveaway-draw-service
 import type {
   CompletedDraw,
   DrawRepository,
+  DrawChannel,
   DrawTarget,
 } from '../../src/application/ports/draw-repository.js';
 import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
@@ -51,7 +52,11 @@ class FakeDrawRepository implements DrawRepository {
   drawing: DrawTarget[] = [];
   readonly savedSnapshots: DrawSnapshot[] = [];
   readonly completions: Array<{ places: DrawPlace[]; cursor: number }> = [];
-  readonly failures: Array<{ stage: string; errorKind: string }> = [];
+  readonly failures: Array<{
+    stage: string;
+    errorKind: string;
+    channel?: DrawChannel;
+  }> = [];
   retryResult = false;
   completionError: Error | null = null;
 
@@ -88,7 +93,11 @@ class FakeDrawRepository implements DrawRepository {
       excludedParticipantIds: [],
     });
   }
-  failDraw(input: { stage: string; errorKind: string }): Promise<void> {
+  failDraw(input: {
+    stage: string;
+    errorKind: string;
+    channel?: DrawChannel;
+  }): Promise<void> {
     this.failures.push(input);
     return Promise.resolve();
   }
@@ -199,6 +208,39 @@ describe('GiveawayDrawService', () => {
       expect.objectContaining({
         stage: 'final_eligibility',
         errorKind: 'membership_unknown',
+        channel: target().channels[0],
+      }),
+    ]);
+  });
+
+  it('attaches stored channel identity to a final Telegram channel failure', async () => {
+    const repository = new FakeDrawRepository();
+    repository.due.push(target({ channels: target().channels.slice(0, 1) }));
+    const gateway = new FakeDrawGateway();
+    gateway.channelFailures.push(
+      new TelegramDeliveryError('network', 'unknown', null, {
+        kind: 'network',
+      }),
+      new TelegramDeliveryError('network', 'unknown', null, {
+        kind: 'network',
+      }),
+      new TelegramDeliveryError('network', 'unknown', null, {
+        kind: 'network',
+      }),
+    );
+
+    await createService(repository, gateway).processDue();
+
+    expect(repository.failures).toEqual([
+      expect.objectContaining({
+        stage: 'final_eligibility',
+        errorKind: 'telegram_network',
+        channel: {
+          id: 'channel-1',
+          telegramChatId: -1001,
+          username: 'one',
+          title: 'One',
+        },
       }),
     ]);
   });

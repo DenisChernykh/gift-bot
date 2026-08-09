@@ -64,6 +64,13 @@
       "when": 1786264066229,
       "tag": "0008_natural_mysterio",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1786268628002,
+      "tag": "0009_shocking_storm",
+      "breakpoints": true
     }
   ]
 }

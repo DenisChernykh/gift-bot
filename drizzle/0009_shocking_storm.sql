@@ -1,0 +1,1 @@
+ALTER TABLE `draw_runs` ADD `failure_context` text;

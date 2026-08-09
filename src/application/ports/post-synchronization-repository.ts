@@ -21,6 +21,7 @@ export interface PostSynchronizationRepository {
   failTask(input: {
     id: string;
     errorKind: string;
+    terminal: boolean;
     availableAt: number;
     now: number;
   }): Promise<void>;

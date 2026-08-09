@@ -564,10 +564,15 @@ async function handleCallbackAction(
     case 'retry_draw': {
       const giveawayId = stringPayload(action.payload, 'giveawayId');
       const retried = await dependencies.draws.retryFailed(giveawayId);
+      const currentState = retried
+        ? null
+        : (await dependencies.management.getGiveawaySummary(giveawayId)).state;
       await context.reply(
         retried
           ? 'Повторное завершение обработано. Актуальное состояние показано в /giveaways.'
-          : 'Повторное завершение уже недоступно.',
+          : currentState === 'failed'
+            ? 'Уведомление об ошибке ещё отправляется. Завершение не запущено; после доставки откройте /giveaways и повторите.'
+            : 'Повторное завершение уже недоступно.',
       );
       return;
     }
@@ -596,6 +601,12 @@ async function handleCallbackAction(
         );
         return;
       }
+      if (result.kind === 'notification_in_flight') {
+        await context.reply(
+          'Сейчас отправляется уведомление прежнему победителю. Победитель не изменён; повторите этой же кнопкой после завершения доставки.',
+        );
+        return;
+      }
       await context.reply(
         result.newParticipantId
           ? `Место ${result.placeNumber} обновлено. Новый участник snapshot: ${result.newParticipantId}. Публичная синхронизация поставлена в очередь.`
@@ -604,14 +615,41 @@ async function handleCallbackAction(
       return;
     }
     case 'view_reroll_audit': {
+      const giveawayId = stringPayload(action.payload, 'giveawayId');
       const audit = await dependencies.rerolls.listAudit(
-        stringPayload(action.payload, 'giveawayId'),
+        giveawayId,
       );
-      await context.reply(
-        audit.length === 0
-          ? 'Перевыборов ещё не было.'
-          : audit.map(formatRerollAuditEntry).join('\n\n'),
-      );
+      if (audit.length === 0) {
+        await context.reply('Перевыборов ещё не было.');
+        return;
+      }
+      const pages = formatRerollAuditPages(audit);
+      const page = optionalPagePayload(action.payload);
+      if (page >= pages.length) throw new Error('Reroll audit page is unavailable');
+      const keyboard = new InlineKeyboard();
+      if (page > 0) {
+        keyboard.text(
+          'Предыдущая',
+          await issueAdminCallback(dependencies, actorTelegramId, {
+            giveawayId,
+            action: 'view_reroll_audit',
+            payload: { giveawayId, page: page - 1 },
+          }),
+        );
+      }
+      if (page + 1 < pages.length) {
+        keyboard.text(
+          'Следующая',
+          await issueAdminCallback(dependencies, actorTelegramId, {
+            giveawayId,
+            action: 'view_reroll_audit',
+            payload: { giveawayId, page: page + 1 },
+          }),
+        );
+      }
+      await context.reply(pages[page]!, {
+        ...(pages.length > 1 ? { reply_markup: keyboard } : {}),
+      });
       return;
     }
     case 'request_cancel_giveaway': {
@@ -1006,6 +1044,15 @@ function numberPayload(payload: Record<string, unknown>, key: string): number {
   return value;
 }
 
+function optionalPagePayload(payload: Record<string, unknown>): number {
+  const value = payload.page;
+  if (value === undefined) return 0;
+  if (!Number.isInteger(value) || Number(value) < 0) {
+    throw new Error('Invalid audit page');
+  }
+  return Number(value);
+}
+
 function publicationResultText(result: Awaited<ReturnType<GiveawayPublicationService['publish']>>) {
   switch (result.kind) {
     case 'active':
@@ -1028,6 +1075,7 @@ function formatGiveawayListItem(item: Awaited<ReturnType<GiveawayManagementServi
     up_to_date: 'актуально',
     pending: 'ожидает синхронизации',
     processing: 'синхронизируется',
+    failed: 'ошибка синхронизации',
   }[item.synchronizationState];
   const warnings = item.warnings
     .map(
@@ -1048,7 +1096,7 @@ function formatGiveawayListItem(item: Awaited<ReturnType<GiveawayManagementServi
       ? formatPublicationDiagnostic({ giveawayId: item.id, diagnostic: item.failure })
       : '',
     item.drawFailure
-      ? `Завершение остановлено. Этап: ${item.drawFailure.stage}; ошибка: ${item.drawFailure.errorKind}.`
+      ? `Завершение остановлено. Этап: ${item.drawFailure.stage}; ошибка: ${item.drawFailure.errorKind}.${item.drawFailure.channel ? `\nКанал: @${item.drawFailure.channel.username} (ID ${item.drawFailure.channel.id}, chat ${item.drawFailure.channel.telegramChatId}).` : ''}`
       : '',
   ]
     .filter(Boolean)
@@ -1065,26 +1113,65 @@ function formatParticipant(participant: {
     : `${participant.displayName} (Telegram ID ${participant.telegramUserId})`;
 }
 
-function formatRerollAuditEntry(
+function formatRerollAuditEntryLines(
   entry: Awaited<ReturnType<GiveawayRerollService['listAudit']>>[number],
-): string {
-  const skipped = entry.skippedCandidates
-    .map(
-      (candidate) =>
-        `${formatParticipant(candidate.participant)}: ${candidate.reason}`,
-    )
-    .join('\n');
+): string[] {
   return [
     `Место ${entry.placeNumber}: ${formatParticipant(entry.previousParticipant)} → ${entry.newParticipant ? formatParticipant(entry.newParticipant) : 'empty'}`,
     `Оператор: ${entry.operatorTelegramId}`,
     `Причина: ${entry.reason}`,
     `Пропущено по подписке: ${entry.skippedCandidates.length}`,
-    skipped,
+    ...entry.skippedCandidates.map(
+      (candidate) =>
+        `${formatParticipant(candidate.participant)}: ${candidate.reason}`,
+    ),
     `Синхронизация: ${entry.syncStatus}; уведомления: ${entry.notificationStatus}`,
     `Завершено: ${new Date(entry.finishedAt).toISOString()}`,
-  ]
-    .filter(Boolean)
-    .join('\n');
+  ];
+}
+
+function formatRerollAuditPages(
+  audit: Awaited<ReturnType<GiveawayRerollService['listAudit']>>,
+): string[] {
+  const lines = audit.flatMap((entry, index) => [
+    ...(index === 0 ? [] : ['']),
+    ...formatRerollAuditEntryLines(entry),
+  ]);
+  const chunks = chunkPrivateLines(lines, 4_032);
+  return chunks.map(
+    (chunk, index) =>
+      `История перевыборов — страница ${index + 1}/${chunks.length}\n${chunk.join('\n')}`,
+  );
+}
+
+function chunkPrivateLines(lines: string[], maximumLength: number): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let currentLength = 0;
+  for (const source of lines) {
+    const pieces: string[] = [];
+    let piece = '';
+    for (const character of source) {
+      if (piece.length + character.length > maximumLength) {
+        pieces.push(piece);
+        piece = '';
+      }
+      piece += character;
+    }
+    pieces.push(piece);
+    for (const line of pieces) {
+      const nextLength = currentLength + (current.length === 0 ? 0 : 1) + line.length;
+      if (current.length > 0 && nextLength > maximumLength) {
+        chunks.push(current);
+        current = [];
+        currentLength = 0;
+      }
+      current.push(line);
+      currentLength += (current.length === 1 ? 0 : 1) + line.length;
+    }
+  }
+  if (current.length > 0 || chunks.length === 0) chunks.push(current);
+  return chunks;
 }
 
 function formatPublicationDiagnostic(input: {

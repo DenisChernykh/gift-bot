@@ -1,4 +1,5 @@
 import type {
+  DrawChannel,
   DrawRepository,
   DrawTarget,
 } from './ports/draw-repository.js';
@@ -45,11 +46,17 @@ const defaultDependencies: Omit<
 
 class FinalEligibilityError extends Error {
   readonly errorKind: string;
+  readonly channel: DrawChannel | undefined;
 
-  constructor(errorKind: string, options?: ErrorOptions) {
+  constructor(
+    errorKind: string,
+    channel?: DrawChannel,
+    options?: ErrorOptions,
+  ) {
     super(errorKind, options);
     this.name = 'FinalEligibilityError';
     this.errorKind = errorKind;
+    this.channel = channel;
   }
 }
 
@@ -143,6 +150,9 @@ export class GiveawayDrawService {
         giveawayId: target.id,
         stage: failureStage,
         errorKind: classified,
+        ...(error instanceof FinalEligibilityError && error.channel
+          ? { channel: error.channel }
+          : {}),
         teamTelegramIds: this.#dependencies.teamTelegramIds,
         now: this.#dependencies.now(),
       });
@@ -156,14 +166,14 @@ export class GiveawayDrawService {
       throw new FinalEligibilityError('channel_missing');
     }
     for (const channel of target.channels) {
-      const snapshot = await this.#telegramCall(() =>
+      const snapshot = await this.#channelCall(channel, () =>
         this.#gateway.getChannelSnapshot(channel.telegramChatId),
       );
       if (!snapshot.username) {
-        throw new FinalEligibilityError('channel_username_missing');
+        throw new FinalEligibilityError('channel_username_missing', channel);
       }
       if (!hasPublicationAdministratorRights(snapshot.membership)) {
-        throw new FinalEligibilityError('bot_admin_rights_lost');
+        throw new FinalEligibilityError('bot_admin_rights_lost', channel);
       }
     }
 
@@ -180,14 +190,14 @@ export class GiveawayDrawService {
       checks,
       this.#dependencies.membershipConcurrency,
       async ({ participant, channel }) => {
-        const membership = await this.#telegramCall(() =>
+        const membership = await this.#channelCall(channel, () =>
           this.#gateway.getParticipantMembership(
             channel.telegramChatId,
             participant.telegramUserId,
           ),
         );
         if (membership.status === 'unknown') {
-          throw new FinalEligibilityError('membership_unknown');
+          throw new FinalEligibilityError('membership_unknown', channel);
         }
         if (!isEligibleParticipantMembership(membership)) {
           eligibility.set(participant.participantId, false);
@@ -217,6 +227,24 @@ export class GiveawayDrawService {
       }
     }
     throw new Error('Unreachable Telegram retry state');
+  }
+
+  async #channelCall<Result>(
+    channel: DrawChannel,
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    try {
+      return await this.#telegramCall(operation);
+    } catch (error) {
+      if (error instanceof TelegramDeliveryError) {
+        throw new FinalEligibilityError(
+          telegramErrorKind(error),
+          channel,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
   }
 }
 

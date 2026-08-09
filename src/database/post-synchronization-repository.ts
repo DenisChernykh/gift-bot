@@ -299,16 +299,18 @@ export class SqlitePostSynchronizationRepository
   async failTask(input: {
     id: string;
     errorKind: string;
+    terminal: boolean;
     availableAt: number;
     now: number;
   }): Promise<void> {
     await this.#database.execute(
       `update sync_tasks
-          set status = 'pending', attempts = attempts + 1,
+          set status = ?, attempts = attempts + 1,
               available_at = max(available_at, ?),
               last_error_kind = ?, updated_at = ?
         where id = ? and status in ('processing', 'pending')`,
       [
+        input.terminal ? 'failed' : 'pending',
         input.availableAt,
         input.errorKind,
         input.now,
@@ -322,7 +324,7 @@ export class SqlitePostSynchronizationRepository
     await this.#refreshRerollSyncStatus(
       input.id,
       tasks[0]?.payload ?? '',
-      true,
+      input.terminal ? 'failed' : 'retrying',
     );
   }
 
@@ -337,15 +339,15 @@ export class SqlitePostSynchronizationRepository
   async #refreshRerollSyncStatus(
     taskId: string,
     payload: string,
-    failed: boolean,
+    failureStatus: 'retrying' | 'failed' | false,
   ): Promise<void> {
     const operationId = resultOperationId(payload);
     if (!operationId) return;
-    if (failed) {
+    if (failureStatus) {
       await this.#database.execute(
-        `update reroll_operations set sync_status = 'retrying'
+        `update reroll_operations set sync_status = ?
           where id = ? and sync_status in ('pending', 'retrying')`,
-        [operationId],
+        [failureStatus, operationId],
       );
       return;
     }

@@ -925,13 +925,17 @@ export class SqliteGiveawayCreationRepository
       updatedAt: number;
       participantCount: number;
       referralsEnabled: number;
-      synchronizationState: 'up_to_date' | 'pending' | 'processing';
+      synchronizationState: 'up_to_date' | 'pending' | 'processing' | 'failed';
     }>(
       `select g.id, g.title, g.state, g.updated_at as updatedAt,
               (select count(*) from participants p
                 where p.giveaway_id = g.id) as participantCount,
               g.referrals_enabled as referralsEnabled,
               case
+                when exists (
+                  select 1 from sync_tasks s
+                   where s.giveaway_id = g.id and s.status = 'failed'
+                ) then 'failed'
                 when exists (
                   select 1 from sync_tasks s
                    where s.giveaway_id = g.id and s.status = 'processing'
@@ -996,9 +1000,11 @@ export class SqliteGiveawayCreationRepository
       giveawayId: string;
       stage: string;
       errorKind: string;
+      failureContext: string | null;
     }>(
       `select g.id as giveawayId, r.failure_stage as stage,
-              r.failure_error_kind as errorKind
+              r.failure_error_kind as errorKind,
+              r.failure_context as failureContext
          from giveaways g join draw_runs r on r.giveaway_id = g.id
         where g.created_by_telegram_id = ? and g.state = 'failed'
           and r.failure_stage is not null and r.failure_error_kind is not null`,
@@ -1046,6 +1052,7 @@ export class SqliteGiveawayCreationRepository
               drawFailure: {
                 stage: drawFailure.stage,
                 errorKind: drawFailure.errorKind,
+                ...drawFailureContext(drawFailure.failureContext),
               },
             }
           : base;
@@ -1064,6 +1071,7 @@ export class SqliteGiveawayCreationRepository
               drawFailure: {
                 stage: drawFailure.stage,
                 errorKind: drawFailure.errorKind,
+                ...drawFailureContext(drawFailure.failureContext),
               },
             }
           : {}),
@@ -1992,5 +2000,39 @@ export class SqliteGiveawayCreationRepository
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };
+  }
+}
+
+function drawFailureContext(value: string | null): {
+  channel?: {
+    id: string;
+    telegramChatId: number;
+    username: string;
+    title: string;
+  };
+} {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as { channel?: Record<string, unknown> };
+    const channel = parsed.channel;
+    if (
+      !channel ||
+      typeof channel.id !== 'string' ||
+      typeof channel.telegramChatId !== 'number' ||
+      typeof channel.username !== 'string' ||
+      typeof channel.title !== 'string'
+    ) {
+      return {};
+    }
+    return {
+      channel: {
+        id: channel.id,
+        telegramChatId: channel.telegramChatId,
+        username: channel.username,
+        title: channel.title,
+      },
+    };
+  } catch {
+    return {};
   }
 }
