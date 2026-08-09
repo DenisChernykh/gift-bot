@@ -19,14 +19,12 @@ type ApplyProfileInput = Parameters<typeof applyProductionBotProfile>[0];
 export type ProfileConfigurationDependencies = {
   readAvatar(path: string): Promise<Uint8Array>;
   createApi(token: string): ProductionProfileApi;
-  createAvatar(path: string): InputFile;
   applyProfile(input: ApplyProfileInput): Promise<void>;
 };
 
 const defaultDependencies: ProfileConfigurationDependencies = {
   readAvatar: readFile,
   createApi: (token) => new Api(token),
-  createAvatar: (path) => new InputFile(path),
   applyProfile: applyProductionBotProfile,
 };
 
@@ -71,11 +69,16 @@ export async function configureTelegramProfile(
 ): Promise<void> {
   const avatarBytes = await dependencies.readAvatar(PRODUCTION_AVATAR_JPG_PATH);
   assertStaticJpeg(avatarBytes);
+  const avatar = new InputFile(
+    avatarBytes,
+    'strelchuk-giveaways-avatar.jpg',
+  );
+  const api = dependencies.createApi(input.botToken);
 
   await dependencies.applyProfile({
-    api: dependencies.createApi(input.botToken),
+    api,
     operatorTelegramIds: input.operatorTelegramIds,
-    avatar: dependencies.createAvatar(PRODUCTION_AVATAR_JPG_PATH),
+    avatar,
     ...(input.onStep ? { onStep: input.onStep } : {}),
   });
 }

@@ -52,7 +52,6 @@ describe('configure telegram profile', () => {
         apiCreated = true;
         return fakeApi();
       },
-      createAvatar: () => new InputFile(new Uint8Array([1])),
       applyProfile: async () => {
         profileApplied = true;
       },
@@ -71,7 +70,7 @@ describe('configure telegram profile', () => {
 
   it('passes validated local inputs to the guarded profile service', async () => {
     const api = fakeApi();
-    const avatar = new InputFile(new Uint8Array([1]));
+    const approvedAvatar = await readFile(PRODUCTION_AVATAR_JPG_PATH);
     let received:
       | {
           api: ProductionProfileApi;
@@ -80,12 +79,11 @@ describe('configure telegram profile', () => {
         }
       | undefined;
     const dependencies: ProfileConfigurationDependencies = {
-      readAvatar: async () => readFile(PRODUCTION_AVATAR_JPG_PATH),
+      readAvatar: async () => approvedAvatar,
       createApi: (token) => {
         expect(token).toBe('local-test-token');
         return api;
       },
-      createAvatar: () => avatar,
       applyProfile: async (input) => {
         received = input;
       },
@@ -96,11 +94,10 @@ describe('configure telegram profile', () => {
       dependencies,
     );
 
-    expect(received).toEqual({
-      api,
-      operatorTelegramIds: [700, 701],
-      avatar,
-    });
+    expect(received?.api).toBe(api);
+    expect(received?.operatorTelegramIds).toEqual([700, 701]);
+    expect(received?.avatar.filename).toBe('strelchuk-giveaways-avatar.jpg');
+    expect(await received?.avatar.toRaw()).toBe(approvedAvatar);
   });
 
   it('projects a remote failure without the raw Telegram detail', () => {

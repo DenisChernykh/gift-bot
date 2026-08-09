@@ -66,6 +66,9 @@ export function registerGiftBotHandlers(
       );
       return;
     }
+    if (payload !== '' && !(await requireAdministrator(context, dependencies))) {
+      return;
+    }
     if (!dependencies.teamTelegramIds.has(context.from!.id)) {
       await context.reply(PUBLIC_START_MESSAGE);
       return;

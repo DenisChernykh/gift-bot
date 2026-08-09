@@ -426,6 +426,16 @@ describe('grammY Gift Bot adapter authorization', () => {
       'Добро пожаловать в «Розыгрыши Татьяны Стрельчук».\n\n/new — создать розыгрыш\n/giveaways — открыть мои розыгрыши\n/cancel — отменить розыгрыш или текущую настройку',
     );
   });
+
+  it('keeps an unknown start payload fail closed for a non-operator', async () => {
+    const { bot, fakeApi } = await openTestBot([700]);
+
+    await bot.handleUpdate(privateMessageUpdate(101, 999, '/start unknown'));
+
+    expect(fakeApi.sentMessages()[0]!.payload.text).toBe(
+      'Эта команда недоступна.',
+    );
+  });
 });
 
 describe('grammY Gift Bot adapter channel and join routes', () => {
