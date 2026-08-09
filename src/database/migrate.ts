@@ -2,9 +2,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import 'dotenv/config';
 import { migrate } from 'drizzle-orm/sqlite-proxy/migrator';
 
+import { loadRuntimeEnvironment } from '../config/runtime-environment.js';
 import {
   createDatabaseProxy,
   openDatabase,
@@ -37,6 +37,7 @@ export async function migrateDatabaseAt(databasePath: string): Promise<void> {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  loadRuntimeEnvironment();
   const databasePath = process.env.DATABASE_PATH;
   if (!databasePath) {
     throw new Error('DATABASE_PATH is required');

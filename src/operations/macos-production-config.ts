@@ -3,13 +3,14 @@ import { isAbsolute, relative } from 'node:path';
 import { parse } from 'dotenv';
 
 import { parseDrawMembershipConcurrency } from '../config/draw.js';
+import { parseLogLevel, type LogLevel } from '../config/log-level.js';
 import { parseTeamTelegramIds } from '../config/team-telegram-ids.js';
 
 export type ProductionEnvironment = {
   botToken: string;
   teamTelegramIds: number[];
   databasePath: string;
-  logLevel: 'info' | 'error';
+  logLevel: LogLevel;
   drawMembershipConcurrency: number;
 };
 
@@ -46,10 +47,7 @@ export function parseProductionEnvironment(input: {
     );
   }
 
-  const logLevel = required('LOG_LEVEL');
-  if (logLevel !== 'info' && logLevel !== 'error') {
-    throw new Error('LOG_LEVEL must be info or error');
-  }
+  const logLevel = parseLogLevel(required('LOG_LEVEL'));
 
   const teamTelegramIds = parseTeamTelegramIds(required('TEAM_TELEGRAM_IDS'));
   if (teamTelegramIds.length === 0) {

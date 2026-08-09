@@ -2,7 +2,6 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomInt } from 'node:crypto';
 
-import 'dotenv/config';
 import { Bot, GrammyError, HttpError } from 'grammy';
 
 import { CallbackActionService } from './application/callback-action-service.js';
@@ -21,6 +20,8 @@ import { GiveawayRerollService } from './application/giveaway-reroll-service.js'
 import { ParticipantRegistrationService } from './application/participant-registration-service.js';
 import { parseTeamTelegramIds } from './config/team-telegram-ids.js';
 import { parseDrawMembershipConcurrency } from './config/draw.js';
+import { parseLogLevel } from './config/log-level.js';
+import { loadRuntimeEnvironment } from './config/runtime-environment.js';
 import { openDatabase } from './database/client.js';
 import { SqliteDrawRepository } from './database/draw-repository.js';
 import { SqliteGiveawayCreationRepository } from './database/giveaway-creation-repository.js';
@@ -35,6 +36,8 @@ import {
 import { createJsonLogger } from './runtime/logger.js';
 import { registerGiftBotHandlers } from './telegram/gift-bot-adapter.js';
 
+loadRuntimeEnvironment();
+
 const botToken = requiredEnvironment('BOT_TOKEN');
 const databasePath = requiredEnvironment('DATABASE_PATH');
 const teamTelegramIds = new Set(
@@ -43,7 +46,7 @@ const teamTelegramIds = new Set(
 const drawMembershipConcurrency = parseDrawMembershipConcurrency(
   process.env.DRAW_MEMBERSHIP_CONCURRENCY,
 );
-const logger = createJsonLogger(process.env.LOG_LEVEL ?? 'info');
+const logger = createJsonLogger(parseLogLevel(process.env.LOG_LEVEL));
 
 mkdirSync(dirname(databasePath), { recursive: true });
 const opened = openDatabase(databasePath);
