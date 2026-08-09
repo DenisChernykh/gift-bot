@@ -1,6 +1,6 @@
 # Gift Bot
 
-Telegram-бот для создания, публикации и полного жизненного цикла розыгрышей. Epic 3 добавляет автоматическое завершение, неизменяемый снимок участников и билетов, немедленную публикацию победителей и приватный перевыбор одного места.
+Telegram-бот для создания, публикации и полного жизненного цикла розыгрышей. Epic 3 добавляет автоматическое завершение, неизменяемый снимок участников и билетов, немедленную публикацию победителей и приватный перевыбор одного места. Epic 4 закрепляет production-профиль и ролевой Telegram UX без изменения бизнес-правил.
 
 ## Локальный запуск
 
@@ -44,6 +44,23 @@ pnpm db:migrate   # применить существующие миграции
 ```
 
 `pnpm dev` и `pnpm start` используют long polling, поэтому не запускайте два экземпляра с одним ботом одновременно. Перед polling процесс восстанавливает незавершённые публикации и фоновые задачи; при остановке он дожидается и Telegram updates, и выполняющегося фонового прохода перед закрытием SQLite.
+
+## Production-профиль Telegram
+
+Сначала создайте через [BotFather](https://t.me/BotFather) отдельного бота с точным username `@strelchuk_giveaways_bot`. Храните его `BOT_TOKEN` и `TEAM_TELEGRAM_IDS` только во внешнем файле `~/Library/Application Support/StrelchukGiveawaysBot/production.env` с правами `0600`; не копируйте production token в репозиторий.
+
+Перед применением профиля выполните полный локальный gate, затем одноразовую команду:
+
+```sh
+node --version
+pnpm --version
+pnpm check
+DOTENV_CONFIG_PATH="$HOME/Library/Application Support/StrelchukGiveawaysBot/production.env" pnpm profile:apply
+```
+
+Команда сначала проверяет локальный статический JPG и вызывает read-only `getMe`. Любой username, кроме точного `strelchuk_giveaways_bot`, блокирует все изменяющие Bot API вызовы. После успешного preflight команда последовательно применяет имя, описания, default-команду `/start`, отдельное меню для каждого allowlisted оператора и JPG-аватар. Telegram не предоставляет транзакцию для этих шагов: при частичном отказе исправьте причину и безопасно повторите ту же команду.
+
+Исходный master-asset находится в `assets/telegram/strelchuk-giveaways-avatar-source.png`, а подготовленный upload — в `assets/telegram/strelchuk-giveaways-avatar.jpg`; оба имеют размер `1254×1254`. `profile:apply` никогда не запускается из `pnpm dev`, `pnpm start` или обычного long-polling startup.
 
 ## SQLite и резервная копия
 
