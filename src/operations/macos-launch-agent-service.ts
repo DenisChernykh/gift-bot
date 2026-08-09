@@ -217,7 +217,11 @@ export class MacosLaunchAgentService {
   async stop(): Promise<'stopped' | 'already_absent'> {
     if (!(await this.isLoaded())) return 'already_absent';
     requireSuccess(
-      await this.input.host.run('launchctl', ['bootout', this.serviceTarget]),
+      await this.input.host.run('launchctl', [
+        'bootout',
+        '--wait',
+        this.serviceTarget,
+      ]),
       'launchctl bootout',
     );
     return 'stopped';

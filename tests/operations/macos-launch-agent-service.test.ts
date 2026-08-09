@@ -283,7 +283,12 @@ describe('MacosLaunchAgentService install', () => {
   });
 });
 
-function lifecycleFixture(options: { installed?: boolean; loaded?: boolean } = {}) {
+function lifecycleFixture(options: {
+  installed?: boolean;
+  loaded?: boolean;
+  bootoutCompletion?: Promise<void>;
+  bootoutExitCode?: number;
+} = {}) {
   let loaded = options.loaded ?? false;
   const files = new Set<string>();
   if (options.installed ?? true) files.add(paths.plistPath);
@@ -310,7 +315,15 @@ function lifecycleFixture(options: { installed?: boolean; loaded?: boolean } = {
         return { exitCode: loaded ? 0 : 113, stdout: '', stderr: '' };
       }
       if (command === 'launchctl' && args[0] === 'bootstrap') loaded = true;
-      if (command === 'launchctl' && args[0] === 'bootout') loaded = false;
+      if (command === 'launchctl' && args[0] === 'bootout') {
+        if (args.includes('--wait')) await options.bootoutCompletion;
+        if ((options.bootoutExitCode ?? 0) === 0) loaded = false;
+        return {
+          exitCode: options.bootoutExitCode ?? 0,
+          stdout: '',
+          stderr: '',
+        };
+      }
       return { exitCode: 0, stdout: '', stderr: '' };
     },
     verifyBotUsername: async () => 'strelchuk_giveaways_bot',
@@ -345,7 +358,7 @@ describe('MacosLaunchAgentService lifecycle', () => {
     await expect(service.stop()).resolves.toBe('stopped');
     expect(isLoaded()).toBe(false);
     expect(events.at(-1)).toBe(
-      'run:launchctl:bootout gui/501/ru.strelchuk.giveaways-bot',
+      'run:launchctl:bootout --wait gui/501/ru.strelchuk.giveaways-bot',
     );
 
     await expect(service.start()).resolves.toBe('started');
@@ -367,14 +380,50 @@ describe('MacosLaunchAgentService lifecycle', () => {
     expect(events.filter((event) => event.includes(':bootout '))).toHaveLength(1);
   });
 
-  it('restarts through an explicit bootout and bootstrap pair', async () => {
-    const { service, events, isLoaded } = lifecycleFixture({ loaded: true });
+  it('waits for delayed bootout completion before restart bootstraps again', async () => {
+    let completeBootout!: () => void;
+    const bootoutCompletion = new Promise<void>((resolve) => {
+      completeBootout = resolve;
+    });
+    const { service, events, isLoaded } = lifecycleFixture({
+      loaded: true,
+      bootoutCompletion,
+    });
+    let settled = false;
+    const restart = service.restart().then((state) => {
+      settled = true;
+      return state;
+    });
 
-    await expect(service.restart()).resolves.toBe('restarted');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    expect(events).toContain(
+      'run:launchctl:bootout --wait gui/501/ru.strelchuk.giveaways-bot',
+    );
+    expect(events.filter((event) => event.includes(':bootstrap '))).toHaveLength(0);
+
+    completeBootout();
+    await expect(restart).resolves.toBe('restarted');
 
     expect(isLoaded()).toBe(true);
     expect(events.filter((event) => event.includes(':bootout '))).toHaveLength(1);
     expect(events.filter((event) => event.includes(':bootstrap '))).toHaveLength(1);
+  });
+
+  it('does not bootstrap when waiting for bootout fails', async () => {
+    const { service, events, isLoaded } = lifecycleFixture({
+      loaded: true,
+      bootoutExitCode: 5,
+    });
+
+    await expect(service.restart()).rejects.toThrow('launchctl bootout failed');
+
+    expect(isLoaded()).toBe(true);
+    expect(events).toContain(
+      'run:launchctl:bootout --wait gui/501/ru.strelchuk.giveaways-bot',
+    );
+    expect(events.filter((event) => event.includes(':bootstrap '))).toHaveLength(0);
   });
 
   it('uninstalls only the service registration and plist', async () => {
@@ -383,7 +432,7 @@ describe('MacosLaunchAgentService lifecycle', () => {
     await expect(service.uninstall()).resolves.toBe('uninstalled');
 
     expect(events).toContain(
-      'run:launchctl:bootout gui/501/ru.strelchuk.giveaways-bot',
+      'run:launchctl:bootout --wait gui/501/ru.strelchuk.giveaways-bot',
     );
     expect(events.filter((event) => event.startsWith('unlink:'))).toEqual([
       `unlink:${paths.plistPath}`,
@@ -391,6 +440,18 @@ describe('MacosLaunchAgentService lifecycle', () => {
     expect(files.has(paths.plistPath)).toBe(false);
     expect(events.join('\n')).not.toContain('production.env');
     expect(events.join('\n')).not.toContain('gift-bot.sqlite');
+  });
+
+  it('keeps the plist when waiting for bootout fails during uninstall', async () => {
+    const { service, events, files } = lifecycleFixture({
+      loaded: true,
+      bootoutExitCode: 5,
+    });
+
+    await expect(service.uninstall()).rejects.toThrow('launchctl bootout failed');
+
+    expect(files.has(paths.plistPath)).toBe(true);
+    expect(events.filter((event) => event.startsWith('unlink:'))).toHaveLength(0);
   });
 
   it('returns status, paths and byte-bounded log tails without parsing launchctl output', async () => {
