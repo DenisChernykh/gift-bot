@@ -58,7 +58,7 @@ pnpm check
 DOTENV_CONFIG_PATH="$HOME/Library/Application Support/StrelchukGiveawaysBot/production.env" pnpm profile:apply
 ```
 
-Команда сначала проверяет локальный статический JPG и вызывает read-only `getMe`. Любой username, кроме точного `strelchuk_giveaways_bot`, блокирует все изменяющие Bot API вызовы. После успешного preflight команда последовательно применяет имя, описания, default-команду `/start`, отдельное меню для каждого allowlisted оператора и JPG-аватар. Telegram не предоставляет транзакцию для этих шагов: при частичном отказе исправьте причину и безопасно повторите ту же команду.
+Команда сначала сверяет локальный статический JPG с SHA-256 точного checked-in upload-asset и вызывает read-only `getMe`. Любой username, кроме точного `strelchuk_giveaways_bot`, блокирует все изменяющие Bot API вызовы. После успешного preflight команда последовательно применяет имя, описания, default-команду `/start`, отдельное меню для каждого allowlisted оператора и JPG-аватар. Telegram не предоставляет транзакцию для этих шагов: при частичном отказе исправьте причину и безопасно повторите ту же команду.
 
 Исходный master-asset находится в `assets/telegram/strelchuk-giveaways-avatar-source.png`, а подготовленный upload — в `assets/telegram/strelchuk-giveaways-avatar.jpg`; оба имеют размер `1254×1254`. `profile:apply` никогда не запускается из `pnpm dev`, `pnpm start` или обычного long-polling startup.
 
