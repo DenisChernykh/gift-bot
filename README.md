@@ -76,7 +76,7 @@ LOG_LEVEL=info
 DRAW_MEMBERSHIP_CONCURRENCY=10
 ```
 
-Для `install` все пять значений обязательны, а `TEAM_TELEGRAM_IDS` должен содержать хотя бы одного оператора. LaunchAgent задаёт `DOTENV_CONFIG_OVERRIDE=true`, поэтому именно этот проверенный файл имеет приоритет над одноимёнными переменными, ранее сохранёнными в launchd-domain через `launchctl setenv`.
+Для `install` все пять значений обязательны, а `TEAM_TELEGRAM_IDS` должен содержать хотя бы одного оператора. LaunchAgent задаёт `DOTENV_CONFIG_OVERRIDE=true`; runtime читает указанный файл напрямую как UTF-8 в изолированный объект и только затем заменяет пять application-переменных. Поэтому именно проверенный файл имеет приоритет над одноимёнными значениями из launchd-domain, а наследуемые `DOTENV_CONFIG_ENCODING`, `DOTENV_KEY`, `.env.vault` и другие ambient-настройки dotenv не могут изменить источник production-конфигурации.
 
 Перед первой установкой остановите любой ручной `pnpm dev` или `pnpm start` с тем же token. Команда `install` проверяет Node/pnpm, production build, права и содержимое env, точный username `@strelchuk_giveaways_bot`, отсутствие существующего plist и незагруженный service. Только после полного preflight она создаёт каталоги, валидирует plist через `plutil` и выполняет `launchctl bootstrap`:
 
