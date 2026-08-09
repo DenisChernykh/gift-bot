@@ -1,6 +1,6 @@
 # Gift Bot
 
-Telegram-бот для создания, публикации и полного жизненного цикла розыгрышей. Epic 3 добавляет автоматическое завершение, неизменяемый снимок участников и билетов, немедленную публикацию победителей и приватный перевыбор одного места. Epic 4 закрепляет production-профиль и ролевой Telegram UX без изменения бизнес-правил.
+Telegram-бот для создания, публикации и полного жизненного цикла розыгрышей. Epic 3 добавляет автоматическое завершение, неизменяемый снимок участников и билетов, немедленную публикацию победителей и приватный перевыбор одного места. Epic 4 закрепляет production-профиль и ролевой Telegram UX, а Epic 5 запускает собранный бот как пользовательский macOS LaunchAgent.
 
 ## Локальный запуск
 
@@ -61,6 +61,48 @@ DOTENV_CONFIG_PATH="$HOME/Library/Application Support/StrelchukGiveawaysBot/prod
 Команда сначала сверяет локальный статический JPG с SHA-256 точного checked-in upload-asset и вызывает read-only `getMe`. Любой username, кроме точного `strelchuk_giveaways_bot`, блокирует все изменяющие Bot API вызовы. После успешного preflight команда последовательно применяет имя, описания, default-команду `/start`, отдельное меню для каждого allowlisted оператора и JPG-аватар. Telegram не предоставляет транзакцию для этих шагов: при частичном отказе исправьте причину и безопасно повторите ту же команду.
 
 Исходный master-asset находится в `assets/telegram/strelchuk-giveaways-avatar-source.png`, а подготовленный upload — в `assets/telegram/strelchuk-giveaways-avatar.jpg`; оба имеют размер `1254×1254`. `profile:apply` никогда не запускается из `pnpm dev`, `pnpm start` или обычного long-polling startup.
+
+## Production LaunchAgent на macOS
+
+LaunchAgent `ru.strelchuk.giveaways-bot` работает без `sudo` в GUI-domain текущего пользователя и запускает тот же собранный `dist/index.js`. Он доступен только после входа пользователя в macOS и не работает, пока Mac спит или выключен. После следующего успешного запуска существующий recovery Epic 3 обрабатывает наступившие во время простоя дедлайны.
+
+Production-конфигурация находится вне checkout по пути `/Users/denischernykh/Library/Application Support/StrelchukGiveawaysBot/production.env` и должна принадлежать текущему пользователю с правами `0600`:
+
+```dotenv
+BOT_TOKEN=<production token from BotFather>
+TEAM_TELEGRAM_IDS=<comma-separated numeric Telegram user IDs>
+DATABASE_PATH="/Users/denischernykh/Library/Application Support/StrelchukGiveawaysBot/data/gift-bot.sqlite"
+LOG_LEVEL=info
+DRAW_MEMBERSHIP_CONCURRENCY=10
+```
+
+Перед первой установкой остановите любой ручной `pnpm dev` или `pnpm start` с тем же token. Команда `install` проверяет Node/pnpm, production build, права и содержимое env, точный username `@strelchuk_giveaways_bot`, отсутствие существующего plist и незагруженный service. Только после полного preflight она создаёт каталоги, валидирует plist через `plutil` и выполняет `launchctl bootstrap`:
+
+```sh
+node --version
+pnpm --version
+pnpm check
+pnpm ops:launch-agent -- install
+pnpm ops:launch-agent -- status
+pnpm ops:launch-agent -- logs
+```
+
+Операционный интерфейс:
+
+```sh
+pnpm ops:launch-agent -- start
+pnpm ops:launch-agent -- stop
+pnpm ops:launch-agent -- restart
+pnpm ops:launch-agent -- status
+pnpm ops:launch-agent -- logs
+pnpm ops:launch-agent -- uninstall
+```
+
+`stop` делает `bootout`, поэтому `KeepAlive` не запускает процесс обратно во время обслуживания. `uninstall` удаляет только регистрацию и `~/Library/LaunchAgents/ru.strelchuk.giveaways-bot.plist`; production env, SQLite и логи сохраняются. Команды удаления данных или `purge` нет.
+
+Обновление выполняется явно: `stop` → обновление checkout → `pnpm install` только при изменении lockfile → `pnpm check` → `start` → `status` и `logs`. Автоматических `git pull`, миграционного deployment-runner или самообновления нет; существующие миграции по-прежнему применяет обычный startup `src/index.ts`.
+
+Plist содержит только абсолютные пути, label и `DOTENV_CONFIG_PATH`; token и allowlist в него не записываются. stdout и stderr находятся в `/Users/denischernykh/Library/Logs/StrelchukGiveawaysBot/`. Формат текста `launchctl print` используется только для диагностики и не парсится как стабильный API.
 
 ## SQLite и резервная копия
 
@@ -123,4 +165,4 @@ Join/referral ссылки не содержат внутренних ID. Retry 
 
 Храните `BOT_TOKEN` и ссылки-приглашения как секреты. Токены в базе хешируются; callback payload переключения содержит только invite ID, а actor binding, активное состояние и expiry повторно проверяются по сохранённым данным — исходный invite token в callback не попадает. Не логируйте и не пересылайте токены широким группам. Не делайте внешнего владельца участником allowlist только для подключения канала. Событие `publication_failed` содержит `giveawayId`, `stage`, `errorKind`, `channelId` и `channelUsername`, но никогда token, `BOT_TOKEN` или deep-link payload.
 
-Не добавлены автоматическое распознавание ботов, CAPTCHA, приватные каналы, экспорт, web/API, второй уровень рефералов или LaunchAgent. Подозрительность победителя остаётся человеческим post-publication решением и никогда не задерживает исходный результат.
+Не добавлены автоматическое распознавание ботов, CAPTCHA, приватные каналы, экспорт, web/API или второй уровень рефералов. Подозрительность победителя остаётся человеческим post-publication решением и никогда не задерживает исходный результат. LaunchAgent не является LaunchDaemon, server deployment, backup-системой, log rotation или remote monitoring.
