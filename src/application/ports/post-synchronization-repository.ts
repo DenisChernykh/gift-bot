@@ -2,7 +2,7 @@ import type { TelegramPostEdit } from './telegram-gateway.js';
 
 export type PostSynchronizationTask = {
   id: string;
-  taskType: 'cancel_message' | 'participant_count';
+  taskType: 'cancel_message' | 'result' | 'participant_count';
   payload: string;
   attempts: number;
 };

@@ -4,6 +4,8 @@ import type {
 } from '../application/ports/post-synchronization-repository.js';
 import type { TelegramPostEdit } from '../application/ports/telegram-gateway.js';
 import { renderGiveawayMessage } from '../domain/giveaway-rendering.js';
+import { renderGiveawayResult } from '../domain/giveaway-result-rendering.js';
+import type { DrawSnapshot } from '../domain/giveaway-draw.js';
 import { createStoredToken } from '../domain/tokens.js';
 import type { GiveawayMessageEntity } from '../domain/giveaway-validation.js';
 import type { DatabaseBoundary } from './client.js';
@@ -47,7 +49,7 @@ export class SqlitePostSynchronizationRepository
               end,
               last_error_kind = 'interrupted', updated_at = ?
         where status = 'processing'
-          and task_type in ('cancel_message', 'participant_count')`,
+          and task_type in ('cancel_message', 'result', 'participant_count')`,
       [now, now],
     );
   }
@@ -57,8 +59,12 @@ export class SqlitePostSynchronizationRepository
       `select id, task_type as taskType, payload, attempts
          from sync_tasks
         where status = 'pending' and available_at <= ?
-          and task_type in ('cancel_message', 'participant_count')
-        order by case task_type when 'cancel_message' then 0 else 1 end,
+          and task_type in ('cancel_message', 'result', 'participant_count')
+        order by case task_type
+                   when 'cancel_message' then 0
+                   when 'result' then 1
+                   else 2
+                 end,
                  created_at, id`,
       [now],
     );
@@ -109,6 +115,72 @@ export class SqlitePostSynchronizationRepository
         kind: payload.messageKind,
         text: payload.text,
         entities: [],
+        removeParticipationButton: true,
+      };
+    }
+
+    if (task.taskType === 'result') {
+      const rows = await this.#database.all<{
+        title: string;
+        snapshotJson: string;
+        chatId: number;
+        messageId: number;
+        messageKind: 'text' | 'photo';
+      }>(
+        `select g.title, r.snapshot_json as snapshotJson,
+                c.telegram_chat_id as chatId, d.message_id as messageId,
+                d.message_kind as messageKind
+           from sync_tasks t
+           join giveaways g on g.id = t.giveaway_id
+           join draw_runs r on r.giveaway_id = g.id
+           join giveaway_channels c on c.id = t.giveaway_channel_id
+           join publication_deliveries d on d.giveaway_channel_id = c.id
+           join publication_runs p on p.id = d.publication_run_id
+          where t.id = ? and t.task_type = 'result'
+            and g.state = 'completed' and r.snapshot_json is not null
+            and p.giveaway_id = g.id and p.status = 'succeeded'
+            and d.status = 'delivered' and d.message_id is not null
+          order by d.created_at desc, d.id desc limit 1`,
+        [task.id],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const snapshot = JSON.parse(row.snapshotJson) as DrawSnapshot;
+      const participants = new Map(
+        snapshot.participants.map((participant) => [
+          participant.participantId,
+          participant,
+        ]),
+      );
+      const places = await this.#database.all<{
+        placeNumber: number;
+        participantId: string | null;
+      }>(
+        `select v.place_number as placeNumber,
+                v.participant_id as participantId
+           from prize_place_versions v
+           join draw_runs r on r.id = v.draw_run_id
+           join sync_tasks t on t.giveaway_id = r.giveaway_id
+          where t.id = ? and v.state in ('selected', 'empty')
+          order by v.place_number`,
+        [task.id],
+      );
+      const rendered = renderGiveawayResult({
+        title: row.title,
+        kind: row.messageKind,
+        eligibleParticipantCount: snapshot.participants.length,
+        places: places.map((place) => ({
+          placeNumber: place.placeNumber,
+          participant: place.participantId
+            ? (participants.get(place.participantId) ?? null)
+            : null,
+        })),
+      });
+      return {
+        chatId: row.chatId,
+        messageId: row.messageId,
+        kind: row.messageKind,
+        ...rendered,
         removeParticipationButton: true,
       };
     }
@@ -221,6 +293,7 @@ export class SqlitePostSynchronizationRepository
         input.id,
       ],
     );
+    await this.#refreshRerollSyncStatus(input.id, input.expectedPayload, false);
   }
 
   async failTask(input: {
@@ -242,6 +315,15 @@ export class SqlitePostSynchronizationRepository
         input.id,
       ],
     );
+    const tasks = await this.#database.all<{ payload: string }>(
+      'select payload from sync_tasks where id = ?',
+      [input.id],
+    );
+    await this.#refreshRerollSyncStatus(
+      input.id,
+      tasks[0]?.payload ?? '',
+      true,
+    );
   }
 
   async supersedeTask(id: string, now: number): Promise<void> {
@@ -250,5 +332,67 @@ export class SqlitePostSynchronizationRepository
         where id = ? and status in ('pending', 'processing')`,
       [now, id],
     );
+  }
+
+  async #refreshRerollSyncStatus(
+    taskId: string,
+    payload: string,
+    failed: boolean,
+  ): Promise<void> {
+    const operationId = resultOperationId(payload);
+    if (!operationId) return;
+    if (failed) {
+      await this.#database.execute(
+        `update reroll_operations set sync_status = 'retrying'
+          where id = ? and sync_status in ('pending', 'retrying')`,
+        [operationId],
+      );
+      return;
+    }
+    const taskRows = await this.#database.all<{
+      giveawayId: string;
+    }>(
+      'select giveaway_id as giveawayId from sync_tasks where id = ?',
+      [taskId],
+    );
+    const giveawayId = taskRows[0]?.giveawayId;
+    if (!giveawayId) return;
+    const resultTasks = await this.#database.all<{
+      payload: string;
+      status: string;
+      lastErrorKind: string | null;
+    }>(
+      `select payload, status, last_error_kind as lastErrorKind from sync_tasks
+        where giveaway_id = ? and task_type = 'result'`,
+      [giveawayId],
+    );
+    const delivered =
+      resultTasks.length > 0 &&
+      resultTasks.every(
+        (task) =>
+          resultOperationId(task.payload) === operationId &&
+          task.status === 'completed',
+      );
+    const retrying = resultTasks.some(
+      (task) =>
+        resultOperationId(task.payload) === operationId &&
+        task.lastErrorKind !== null,
+    );
+    await this.#database.execute(
+      `update reroll_operations set sync_status = ?
+        where id = ? and sync_status in ('pending', 'retrying')`,
+      [delivered ? 'delivered' : retrying ? 'retrying' : 'pending', operationId],
+    );
+  }
+}
+
+function resultOperationId(payload: string): string | null {
+  try {
+    const parsed = JSON.parse(payload) as { rerollOperationId?: unknown };
+    return typeof parsed.rerollOperationId === 'string'
+      ? parsed.rerollOperationId
+      : null;
+  } catch {
+    return null;
   }
 }

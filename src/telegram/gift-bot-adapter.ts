@@ -3,8 +3,10 @@ import { InlineKeyboard, type Bot, type Context } from 'grammy';
 import type { CallbackActionService } from '../application/callback-action-service.js';
 import type { ChannelAuthorizationService } from '../application/channel-authorization-service.js';
 import type { DraftWizardService } from '../application/draft-wizard-service.js';
+import type { GiveawayDrawService } from '../application/giveaway-draw-service.js';
 import type { GiveawayCancellationService } from '../application/giveaway-cancellation-service.js';
 import type { GiveawayManagementService } from '../application/giveaway-management-service.js';
+import type { GiveawayRerollService } from '../application/giveaway-reroll-service.js';
 import type {
   ParticipantRegistrationResult,
   ParticipantRegistrationService,
@@ -31,6 +33,8 @@ export type GiftBotHandlersDependencies = {
   cancellation: GiveawayCancellationService;
   management: GiveawayManagementService;
   participants: ParticipantRegistrationService;
+  draws: GiveawayDrawService;
+  rerolls: GiveawayRerollService;
 };
 
 export function registerGiftBotHandlers(
@@ -84,8 +88,50 @@ export function registerGiftBotHandlers(
     }
     for (const giveaway of giveaways) {
       const cancellable = ['draft', 'active', 'failed'].includes(giveaway.state);
-      const replyMarkup = cancellable
-        ? new InlineKeyboard().text(
+      const replyMarkup = new InlineKeyboard();
+      let hasActions = false;
+      if (giveaway.drawFailure) {
+        replyMarkup.text(
+          'Повторить завершение',
+          await issueAdminCallback(dependencies, context.from!.id, {
+            giveawayId: giveaway.id,
+            action: 'retry_draw',
+            payload: { giveawayId: giveaway.id },
+          }),
+        ).row();
+        hasActions = true;
+      }
+      if (giveaway.state === 'completed') {
+        const completed = await dependencies.rerolls.getCompleted(giveaway.id);
+        for (const place of completed?.places ?? []) {
+          if (place.status !== 'selected') continue;
+          replyMarkup
+            .text(
+              `Перевыбрать место ${place.placeNumber}`,
+              await issueAdminCallback(dependencies, context.from!.id, {
+                giveawayId: giveaway.id,
+                action: 'start_reroll',
+                payload: {
+                  giveawayId: giveaway.id,
+                  placeNumber: place.placeNumber,
+                },
+              }),
+            )
+            .row();
+          hasActions = true;
+        }
+        replyMarkup.text(
+          'История перевыборов',
+          await issueAdminCallback(dependencies, context.from!.id, {
+            giveawayId: giveaway.id,
+            action: 'view_reroll_audit',
+            payload: { giveawayId: giveaway.id },
+          }),
+        ).row();
+        hasActions = true;
+      }
+      if (cancellable) {
+        replyMarkup.text(
             'Отменить',
             await issueCancellationSelection(
               dependencies,
@@ -97,10 +143,11 @@ export function registerGiftBotHandlers(
                 state: giveaway.state as 'draft' | 'active' | 'failed',
               },
             ),
-          )
-        : undefined;
+          );
+        hasActions = true;
+      }
       await context.reply(formatGiveawayListItem(giveaway), {
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        ...(hasActions ? { reply_markup: replyMarkup } : {}),
       });
     }
   });
@@ -164,7 +211,10 @@ export function registerGiftBotHandlers(
     );
     try {
       const action = await dependencies.callbacks.consume(token, context.from.id);
-      if (action.alreadyConsumed && action.action !== 'participant_recheck') {
+      if (
+        action.alreadyConsumed &&
+        !['participant_recheck', 'confirm_reroll'].includes(action.action)
+      ) {
         const text = action.giveawayId
           ? `Уже обработано. Текущее состояние: ${(await dependencies.management.getGiveawaySummary(action.giveawayId)).state}.`
           : 'Уже обработано.';
@@ -249,7 +299,40 @@ export function registerGiftBotHandlers(
   bot.on('message:text', async (context) => {
     if (!dependencies.teamTelegramIds.has(context.from.id)) return;
     const wizard = await dependencies.wizard.findActive(context.from.id);
-    if (!wizard) return;
+    if (!wizard) {
+      const reroll = await dependencies.rerolls.getActive(context.from.id);
+      if (!reroll) return;
+      await safelyReply(context, async () => {
+        if (reroll.state !== 'awaiting_reason') {
+          await context.reply('Подтвердите уже подготовленный перевыбор кнопкой.');
+          return;
+        }
+        const updated = await dependencies.rerolls.submitReason(
+          reroll.id,
+          context.from.id,
+          context.message.text,
+        );
+        const confirmation = await issueAdminCallback(
+          dependencies,
+          context.from.id,
+          {
+            giveawayId: updated.giveawayId,
+            action: 'confirm_reroll',
+            payload: { sessionId: updated.id },
+          },
+        );
+        await context.reply(
+          `Заменить победителя места ${updated.placeNumber} (${formatParticipant(updated.currentParticipant)})? Причина: ${updated.reason}`,
+          {
+            reply_markup: new InlineKeyboard().text(
+              'Подтвердить перевыбор',
+              confirmation,
+            ),
+          },
+        );
+      });
+      return;
+    }
     await safelyReply(context, async () => {
       const value = context.message.text;
       let updated: ActiveWizard;
@@ -478,6 +561,59 @@ async function handleCallbackAction(
       }
       return;
     }
+    case 'retry_draw': {
+      const giveawayId = stringPayload(action.payload, 'giveawayId');
+      const retried = await dependencies.draws.retryFailed(giveawayId);
+      await context.reply(
+        retried
+          ? 'Повторное завершение обработано. Актуальное состояние показано в /giveaways.'
+          : 'Повторное завершение уже недоступно.',
+      );
+      return;
+    }
+    case 'start_reroll': {
+      const session = await dependencies.rerolls.start(
+        stringPayload(action.payload, 'giveawayId'),
+        numberPayload(action.payload, 'placeNumber'),
+        actorTelegramId,
+      );
+      await context.reply(
+        `Введите внутреннюю причину перевыбора места ${session.placeNumber} (от 3 до 500 символов). Текущий победитель: ${formatParticipant(session.currentParticipant)}.`,
+      );
+      return;
+    }
+    case 'confirm_reroll': {
+      const result = await dependencies.rerolls.confirm(
+        stringPayload(action.payload, 'sessionId'),
+        actorTelegramId,
+      );
+      if (result.kind === 'retry_later') {
+        const wait = result.retryAfterMs
+          ? ` Telegram рекомендует подождать ${Math.ceil(result.retryAfterMs / 1000)} сек.`
+          : '';
+        await context.reply(
+          `Не удалось однозначно проверить следующего кандидата.${wait} Текущий победитель не изменён; повторите этой же кнопкой.`,
+        );
+        return;
+      }
+      await context.reply(
+        result.newParticipantId
+          ? `Место ${result.placeNumber} обновлено. Новый участник snapshot: ${result.newParticipantId}. Публичная синхронизация поставлена в очередь.`
+          : `Порядок исчерпан. Место ${result.placeNumber} теперь не заполнено; публичная синхронизация поставлена в очередь.`,
+      );
+      return;
+    }
+    case 'view_reroll_audit': {
+      const audit = await dependencies.rerolls.listAudit(
+        stringPayload(action.payload, 'giveawayId'),
+      );
+      await context.reply(
+        audit.length === 0
+          ? 'Перевыборов ещё не было.'
+          : audit.map(formatRerollAuditEntry).join('\n\n'),
+      );
+      return;
+    }
     case 'request_cancel_giveaway': {
       const giveawayId = stringPayload(action.payload, 'giveawayId');
       const giveaway = await dependencies.management.getGiveawaySummary(
@@ -633,6 +769,24 @@ async function issueCancellationSelection(
         : 'request_cancel_wizard',
     payload:
       target.kind === 'giveaway' ? { giveawayId: target.giveawayId } : {},
+  });
+  return `${ADMIN_CALLBACK_PREFIX}${action.token}`;
+}
+
+async function issueAdminCallback(
+  dependencies: GiftBotHandlersDependencies,
+  actorTelegramId: number,
+  input: {
+    giveawayId: string;
+    action: string;
+    payload: Record<string, unknown>;
+  },
+): Promise<string> {
+  const action = await dependencies.callbacks.issue({
+    actorTelegramId,
+    giveawayId: input.giveawayId,
+    action: input.action,
+    payload: input.payload,
   });
   return `${ADMIN_CALLBACK_PREFIX}${action.token}`;
 }
@@ -886,10 +1040,48 @@ function formatGiveawayListItem(item: Awaited<ReturnType<GiveawayManagementServi
     `Участников: ${item.participantCount}`,
     `Рефералы: ${item.referralsEnabled ? 'включены' : 'выключены'}`,
     `Синхронизация: ${synchronization}`,
+    item.notificationDelivery
+      ? `Уведомления: ожидают доставки ${item.notificationDelivery.pendingCount}; не доставлено ${item.notificationDelivery.failedCount}.`
+      : '',
     warnings,
     item.failure
       ? formatPublicationDiagnostic({ giveawayId: item.id, diagnostic: item.failure })
       : '',
+    item.drawFailure
+      ? `Завершение остановлено. Этап: ${item.drawFailure.stage}; ошибка: ${item.drawFailure.errorKind}.`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function formatParticipant(participant: {
+  telegramUserId: number;
+  username: string | null;
+  displayName: string;
+}): string {
+  return participant.username
+    ? `@${participant.username}`
+    : `${participant.displayName} (Telegram ID ${participant.telegramUserId})`;
+}
+
+function formatRerollAuditEntry(
+  entry: Awaited<ReturnType<GiveawayRerollService['listAudit']>>[number],
+): string {
+  const skipped = entry.skippedCandidates
+    .map(
+      (candidate) =>
+        `${formatParticipant(candidate.participant)}: ${candidate.reason}`,
+    )
+    .join('\n');
+  return [
+    `Место ${entry.placeNumber}: ${formatParticipant(entry.previousParticipant)} → ${entry.newParticipant ? formatParticipant(entry.newParticipant) : 'empty'}`,
+    `Оператор: ${entry.operatorTelegramId}`,
+    `Причина: ${entry.reason}`,
+    `Пропущено по подписке: ${entry.skippedCandidates.length}`,
+    skipped,
+    `Синхронизация: ${entry.syncStatus}; уведомления: ${entry.notificationStatus}`,
+    `Завершено: ${new Date(entry.finishedAt).toISOString()}`,
   ]
     .filter(Boolean)
     .join('\n');

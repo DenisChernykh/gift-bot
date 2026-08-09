@@ -9,10 +9,12 @@ import type { Update, UserFromGetMe } from 'grammy/types';
 import { CallbackActionService } from '../../src/application/callback-action-service.js';
 import { ChannelAuthorizationService } from '../../src/application/channel-authorization-service.js';
 import { DraftWizardService } from '../../src/application/draft-wizard-service.js';
+import { GiveawayDrawService } from '../../src/application/giveaway-draw-service.js';
 import { GiveawayCancellationService } from '../../src/application/giveaway-cancellation-service.js';
 import { GiveawayManagementService } from '../../src/application/giveaway-management-service.js';
 import { GiveawayPostSynchronizationService } from '../../src/application/giveaway-post-synchronization-service.js';
 import { GiveawayPublicationService } from '../../src/application/giveaway-publication-service.js';
+import { GiveawayRerollService } from '../../src/application/giveaway-reroll-service.js';
 import { ParticipantRegistrationService } from '../../src/application/participant-registration-service.js';
 import type {
   TelegramCancelledMessage,
@@ -22,6 +24,7 @@ import type {
 } from '../../src/application/ports/telegram-gateway.js';
 import { TelegramDeliveryError } from '../../src/application/ports/telegram-gateway.js';
 import { openDatabase, type DatabaseBoundary } from '../../src/database/client.js';
+import { SqliteDrawRepository } from '../../src/database/draw-repository.js';
 import { SqliteGiveawayCreationRepository } from '../../src/database/giveaway-creation-repository.js';
 import { migrateDatabase } from '../../src/database/migrate.js';
 import { SqliteParticipantRepository } from '../../src/database/participant-repository.js';
@@ -163,6 +166,18 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
   const participantRepository = new SqliteParticipantRepository(opened.database, {
     createId,
   });
+  const drawRepository = new SqliteDrawRepository(opened.database, { createId });
+  const draws = new GiveawayDrawService(drawRepository, telegramGateway, {
+    randomInt: (maximumExclusive) => maximumExclusive - 1,
+    teamTelegramIds: allowedTelegramIds,
+    now,
+  });
+  const rerolls = new GiveawayRerollService(drawRepository, telegramGateway, {
+    createId,
+    teamTelegramIds: allowedTelegramIds,
+    now,
+    sleep: async () => undefined,
+  });
   const participants = new ParticipantRegistrationService(
     participantRepository,
     telegramGateway,
@@ -204,6 +219,8 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     cancellation,
     management,
     participants,
+    draws,
+    rerolls,
   });
   cleanups.push(async () => {
     await opened.close();
@@ -218,6 +235,9 @@ async function openTestBot(allowedTelegramIds: number[] = [700]) {
     channels,
     callbacks,
     participants,
+    drawRepository,
+    draws,
+    rerolls,
     teamTelegramIds,
     advanceTime: (milliseconds: number) => {
       currentNow += milliseconds;
@@ -1123,5 +1143,267 @@ describe('grammY Gift Bot adapter persisted wizard', () => {
       { id: 'draft-choice', state: 'draft' },
       { id: 'failed-choice', state: 'cancelled' },
     ]);
+  });
+
+  it('runs an actor-bound reroll reason, confirmation, callback replay, and private audit flow', async () => {
+    const {
+      bot,
+      database,
+      fakeApi,
+      telegramGateway,
+      drawRepository,
+    } = await openTestBot();
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, content_entities, created_by_telegram_id,
+         created_at, updated_at
+       ) values ('reroll-gift', 'Reroll gift', 'active', 2, ?, 0,
+                 'text', 'Conditions', '[]', 700, ?, ?)`,
+      [NOW - 1, NOW - 100, NOW - 100],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('reroll-channel', 'reroll-gift', -7001, 'reroll_channel',
+                 'Reroll Channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_runs (id, giveaway_id, status, started_at, finished_at)
+       values ('reroll-publication', 'reroll-gift', 'succeeded', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('reroll-delivery', 'reroll-publication', 'reroll-channel',
+                 'delivered', 777, 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into participants (
+         id, giveaway_id, telegram_user_id, username, display_name,
+         inviter_participant_id, joined_at, updated_at
+       ) values ('alice', 'reroll-gift', 101, 'alice', 'Alice', null, ?, ?),
+                ('bob', 'reroll-gift', 102, 'bob', 'Bob', null, ?, ?),
+                ('carol', 'reroll-gift', 103, 'carol', 'Carol', null, ?, ?),
+                ('dave', 'reroll-gift', 104, 'dave', 'Dave', null, ?, ?)`,
+      [
+        NOW - 40,
+        NOW - 40,
+        NOW - 30,
+        NOW - 30,
+        NOW - 20,
+        NOW - 20,
+        NOW - 10,
+        NOW - 10,
+      ],
+    );
+    await drawRepository.claimNextDue(NOW);
+    await drawRepository.saveSnapshot({
+      giveawayId: 'reroll-gift',
+      snapshot: {
+        version: 1,
+        createdAt: NOW,
+        winnerCount: 2,
+        participants: [
+          ['alice', 101],
+          ['bob', 102],
+          ['carol', 103],
+          ['dave', 104],
+        ].map(([participantId, telegramUserId]) => ({
+          participantId: String(participantId),
+          telegramUserId: Number(telegramUserId),
+          username: String(participantId),
+          displayName: String(participantId),
+          inviterParticipantId: null,
+          validDirectReferralCount: 0,
+          ticketCount: 1,
+        })),
+        ticketOrder: ['alice', 'bob', 'carol', 'dave'],
+      },
+      now: NOW,
+    });
+    await drawRepository.completeDraw({
+      giveawayId: 'reroll-gift',
+      places: [
+        { placeNumber: 1, status: 'selected', participantId: 'alice' },
+        { placeNumber: 2, status: 'selected', participantId: 'bob' },
+      ],
+      cursor: 2,
+      teamTelegramIds: [700],
+      now: NOW,
+    });
+    telegramGateway.participantMemberships.set(103, { status: 'left' });
+    telegramGateway.participantMemberships.set(104, { status: 'member' });
+
+    await bot.handleUpdate(privateMessageUpdate(120, 700, '/giveaways'));
+    const card = fakeApi.sentMessages().at(-1)!;
+    const start = callbackData(card, 'Перевыбрать место 1');
+    await bot.handleUpdate(callbackUpdate(121, 700, start));
+    expect(fakeApi.sentMessages().at(-1)!.payload.text).toContain(
+      'Введите внутреннюю причину',
+    );
+
+    await bot.handleUpdate(
+      privateMessageUpdate(122, 700, 'bot_or_suspicious_account'),
+    );
+    const confirmation = fakeApi.sentMessages().at(-1)!;
+    const confirm = callbackData(confirmation, 'Подтвердить перевыбор');
+    await bot.handleUpdate(callbackUpdate(123, 700, confirm));
+    await bot.handleUpdate(callbackUpdate(124, 700, confirm));
+
+    expect(
+      await database.all(
+        "select count(*) as count from reroll_operations where draw_run_id = (select id from draw_runs where giveaway_id = 'reroll-gift')",
+      ),
+    ).toEqual([{ count: 1 }]);
+    expect((await drawRepository.getCompletedDraw('reroll-gift'))?.places).toEqual([
+      expect.objectContaining({ placeNumber: 1, participantId: 'dave' }),
+      expect.objectContaining({ placeNumber: 2, participantId: 'bob' }),
+    ]);
+    await database.execute(
+      `update reroll_operations set sync_status = 'retrying'
+        where draw_run_id = (
+          select id from draw_runs where giveaway_id = 'reroll-gift'
+        )`,
+    );
+
+    await bot.handleUpdate(privateMessageUpdate(125, 700, '/giveaways'));
+    const firstUpdatedCard = fakeApi.sentMessages().at(-1)!;
+    const secondStart = callbackData(
+      firstUpdatedCard,
+      'Перевыбрать место 1',
+    );
+    await bot.handleUpdate(callbackUpdate(126, 700, secondStart));
+    await bot.handleUpdate(privateMessageUpdate(127, 700, 'second_manual_check'));
+    const secondConfirmation = fakeApi.sentMessages().at(-1)!;
+    const secondConfirm = callbackData(
+      secondConfirmation,
+      'Подтвердить перевыбор',
+    );
+    await bot.handleUpdate(callbackUpdate(128, 700, secondConfirm));
+    expect((await drawRepository.getCompletedDraw('reroll-gift'))?.places).toEqual([
+      expect.objectContaining({
+        placeNumber: 1,
+        status: 'empty',
+        participantId: null,
+      }),
+      expect.objectContaining({ placeNumber: 2, participantId: 'bob' }),
+    ]);
+    expect(
+      await database.all(
+        `select recipient_telegram_id, status
+           from draw_notifications
+          where giveaway_id = 'reroll-gift' and kind = 'winner'
+          order by recipient_telegram_id`,
+      ),
+    ).toEqual([
+      { recipient_telegram_id: 101, status: 'superseded' },
+      { recipient_telegram_id: 102, status: 'pending' },
+      { recipient_telegram_id: 104, status: 'superseded' },
+    ]);
+    expect(
+      await database.all(
+        `select sync_status
+           from reroll_operations
+          where draw_run_id = (
+            select id from draw_runs where giveaway_id = 'reroll-gift'
+          )
+          order by result_revision`,
+      ),
+    ).toEqual([{ sync_status: 'superseded' }, { sync_status: 'pending' }]);
+    await database.execute(
+      `update draw_notifications set status = 'failed',
+             last_error_kind = 'telegram_client'
+        where id = (
+          select id from draw_notifications
+           where giveaway_id = 'reroll-gift' and kind = 'winner'
+             and reroll_operation_id is null and status = 'pending'
+           order by id limit 1
+        )`,
+    );
+
+    await bot.handleUpdate(privateMessageUpdate(129, 700, '/giveaways'));
+    const finalCard = fakeApi.sentMessages().at(-1)!;
+    expect(finalCard.payload.text).toContain('не доставлено 1');
+    const audit = callbackData(finalCard, 'История перевыборов');
+    await bot.handleUpdate(callbackUpdate(130, 700, audit));
+    const auditText = String(fakeApi.sentMessages().at(-1)!.payload.text);
+    expect(auditText).toContain('Причина: bot_or_suspicious_account');
+    expect(auditText).toContain('@alice → @dave');
+    expect(auditText).toContain('@carol: subscription_missing');
+    expect(auditText).toContain('Причина: second_manual_check');
+    expect(auditText).toContain('@dave → empty');
+  });
+
+  it('shows a draw failure diagnostic and retries it only through the actor-bound button', async () => {
+    const {
+      bot,
+      database,
+      fakeApi,
+      telegramGateway,
+      drawRepository,
+    } = await openTestBot([700, 701]);
+    await database.execute(
+      `insert into giveaways (
+         id, title, state, winner_count, deadline_utc, referrals_enabled,
+         content_kind, content_text, created_by_telegram_id, created_at, updated_at
+       ) values ('retry-draw', 'Retry draw', 'active', 1, ?, 0,
+                 'text', 'Conditions', 700, ?, ?)`,
+      [NOW - 1, NOW - 100, NOW - 100],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('retry-channel', 'retry-draw', -8001, 'retry_channel',
+                 'Retry Channel', 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_runs (id, giveaway_id, status, started_at, finished_at)
+       values ('retry-run', 'retry-draw', 'succeeded', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('retry-delivery', 'retry-run', 'retry-channel', 'delivered',
+                 888, 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into participants (
+         id, giveaway_id, telegram_user_id, username, display_name,
+         inviter_participant_id, joined_at, updated_at
+       ) values ('retry-participant', 'retry-draw', 201, 'retry_user',
+                 'Retry User', null, ?, ?)`,
+      [NOW - 10, NOW - 10],
+    );
+    await drawRepository.claimNextDue(NOW);
+    await drawRepository.failDraw({
+      giveawayId: 'retry-draw',
+      stage: 'final_eligibility',
+      errorKind: 'telegram_network',
+      teamTelegramIds: [700],
+      now: NOW,
+    });
+    telegramGateway.participantMemberships.set(201, { status: 'member' });
+
+    await bot.handleUpdate(privateMessageUpdate(130, 700, '/giveaways'));
+    const card = fakeApi.sentMessages().at(-1)!;
+    expect(card.payload.text).toContain('ошибка: telegram_network');
+    const retry = callbackData(card, 'Повторить завершение');
+    await bot.handleUpdate(callbackUpdate(131, 701, retry));
+    expect(await database.all("select state from giveaways where id = 'retry-draw'"))
+      .toEqual([{ state: 'failed' }]);
+    await bot.handleUpdate(callbackUpdate(132, 700, retry));
+    expect(await database.all("select state from giveaways where id = 'retry-draw'"))
+      .toEqual([{ state: 'completed' }]);
   });
 });

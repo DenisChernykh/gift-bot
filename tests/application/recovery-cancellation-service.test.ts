@@ -334,6 +334,38 @@ describe('GiveawayRecoveryService', () => {
 });
 
 describe('GiveawayCancellationService', () => {
+  it('cancels a failed draw by editing the original successful publication', async () => {
+    const { database, gateway, cancellation } = await openLifecycleApplication();
+    await seedGiveaway(database, 'failed', 1);
+    await database.execute(
+      `insert into publication_runs (id, giveaway_id, status, started_at, finished_at)
+       values ('run-active-before-draw', 'giveaway-1', 'succeeded', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('delivery-before-draw', 'run-active-before-draw', 'channel-1',
+                 'delivered', 189, 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into draw_runs (
+         id, giveaway_id, cursor, result_revision, failure_stage,
+         failure_error_kind, started_at, updated_at
+       ) values ('draw-failed', 'giveaway-1', 0, 0, 'final_eligibility',
+                 'telegram_network', ?, ?)`,
+      [NOW, NOW],
+    );
+
+    expect(await cancellation.cancel('giveaway-1')).toMatchObject({
+      kind: 'cancelled',
+      pendingSyncTasks: 0,
+    });
+    expect(gateway.operations).toEqual(['edit:-2001:189']);
+  });
+
   it('cancels a failed giveaway and synchronizes every known message from its bound failed run', async () => {
     const { database, gateway, cancellation } = await openLifecycleApplication();
     await seedGiveaway(database, 'failed', 1);

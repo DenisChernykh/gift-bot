@@ -1,4 +1,7 @@
-import type { PostSynchronizationRepository } from './ports/post-synchronization-repository.js';
+import type {
+  PostSynchronizationRepository,
+  PostSynchronizationTask,
+} from './ports/post-synchronization-repository.js';
 import {
   TelegramDeliveryError,
   type TelegramPostEdit,
@@ -67,7 +70,13 @@ export class GiveawayPostSynchronizationService {
       const task = await this.#repository.claimTask(candidate.id, now);
       if (!task) continue;
       claimedCount += 1;
-      const edit = await this.#repository.getTaskEdit(task);
+      let edit: TelegramPostEdit | null;
+      try {
+        edit = await this.#repository.getTaskEdit(task);
+      } catch (error) {
+        await this.#recordFailure(task, error);
+        continue;
+      }
       if (!edit) {
         await this.#repository.supersedeTask(task.id, this.#dependencies.now());
         continue;
@@ -85,23 +94,30 @@ export class GiveawayPostSynchronizationService {
           now: completedAt,
         });
       } catch (error) {
-        const classified = classifySynchronizationError(error);
-        const delay = Math.max(
-          task.taskType === 'participant_count'
-            ? this.#dependencies.retryIntervalMs
-            : 0,
-          classified.retryAfterMs ?? 0,
-        );
-        const failedAt = this.#dependencies.now();
-        await this.#repository.failTask({
-          id: task.id,
-          errorKind: classified.errorKind,
-          availableAt: failedAt + delay,
-          now: failedAt,
-        });
+        await this.#recordFailure(task, error);
       }
     }
     return claimedCount;
+  }
+
+  async #recordFailure(
+    task: PostSynchronizationTask,
+    error: unknown,
+  ): Promise<void> {
+    const classified = classifySynchronizationError(error);
+    const delay = Math.max(
+      task.taskType === 'participant_count'
+        ? this.#dependencies.retryIntervalMs
+        : 0,
+      classified.retryAfterMs ?? 0,
+    );
+    const failedAt = this.#dependencies.now();
+    await this.#repository.failTask({
+      id: task.id,
+      errorKind: classified.errorKind,
+      availableAt: failedAt + delay,
+      now: failedAt,
+    });
   }
 }
 

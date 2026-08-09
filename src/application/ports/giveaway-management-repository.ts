@@ -25,6 +25,14 @@ export type GiveawayListItem = {
     errorKind: string;
     channels: FailedPublicationChannel[];
   };
+  drawFailure?: {
+    stage: string;
+    errorKind: string;
+  };
+  notificationDelivery?: {
+    pendingCount: number;
+    failedCount: number;
+  };
 };
 
 export type CancellationTarget =

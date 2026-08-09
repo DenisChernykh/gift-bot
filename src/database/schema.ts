@@ -291,5 +291,162 @@ export const syncTasks = sqliteTable(
     uniqueIndex('sync_tasks_participant_count_unique')
       .on(table.giveawayId, table.giveawayChannelId)
       .where(sql`${table.taskType} = 'participant_count'`),
+    uniqueIndex('sync_tasks_result_unique')
+      .on(table.giveawayId, table.giveawayChannelId)
+      .where(sql`${table.taskType} = 'result'`),
+  ],
+);
+
+export const drawRuns = sqliteTable(
+  'draw_runs',
+  {
+    id: text('id').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    snapshotVersion: integer('snapshot_version'),
+    snapshotJson: text('snapshot_json'),
+    cursor: integer('cursor').notNull().default(0),
+    resultRevision: integer('result_revision').notNull().default(0),
+    failureStage: text('failure_stage'),
+    failureErrorKind: text('failure_error_kind'),
+    startedAt: integer('started_at').notNull(),
+    snapshotCreatedAt: integer('snapshot_created_at'),
+    completedAt: integer('completed_at'),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('draw_runs_giveaway_unique').on(table.giveawayId),
+    index('draw_runs_failure_index').on(table.failureStage, table.updatedAt),
+  ],
+);
+
+export const prizePlaceVersions = sqliteTable(
+  'prize_place_versions',
+  {
+    id: text('id').primaryKey(),
+    drawRunId: text('draw_run_id')
+      .notNull()
+      .references(() => drawRuns.id),
+    placeNumber: integer('place_number').notNull(),
+    version: integer('version').notNull(),
+    state: text('state').notNull(),
+    participantId: text('participant_id'),
+    createdAt: integer('created_at').notNull(),
+    rejectedAt: integer('rejected_at'),
+  },
+  (table) => [
+    uniqueIndex('prize_place_versions_run_place_version_unique').on(
+      table.drawRunId,
+      table.placeNumber,
+      table.version,
+    ),
+    uniqueIndex('prize_place_versions_active_unique')
+      .on(table.drawRunId, table.placeNumber)
+      .where(sql`${table.state} in ('selected', 'empty')`),
+  ],
+);
+
+export const rerollOperations = sqliteTable(
+  'reroll_operations',
+  {
+    id: text('id').primaryKey(),
+    drawRunId: text('draw_run_id')
+      .notNull()
+      .references(() => drawRuns.id),
+    placeNumber: integer('place_number').notNull(),
+    operatorTelegramId: integer('operator_telegram_id').notNull(),
+    reason: text('reason').notNull(),
+    previousParticipantId: text('previous_participant_id').notNull(),
+    newParticipantId: text('new_participant_id'),
+    skippedCandidates: text('skipped_candidates').notNull().default('[]'),
+    status: text('status').notNull(),
+    cursorBefore: integer('cursor_before').notNull(),
+    cursorAfter: integer('cursor_after').notNull(),
+    resultRevision: integer('result_revision'),
+    syncStatus: text('sync_status').notNull().default('pending'),
+    notificationStatus: text('notification_status').notNull().default('pending'),
+    startedAt: integer('started_at').notNull(),
+    finishedAt: integer('finished_at'),
+  },
+  (table) => [
+    index('reroll_operations_draw_index').on(
+      table.drawRunId,
+      table.startedAt,
+    ),
+  ],
+);
+
+export const drawExclusions = sqliteTable(
+  'draw_exclusions',
+  {
+    drawRunId: text('draw_run_id')
+      .notNull()
+      .references(() => drawRuns.id),
+    participantId: text('participant_id').notNull(),
+    reason: text('reason').notNull(),
+    rerollOperationId: text('reroll_operation_id').references(
+      () => rerollOperations.id,
+    ),
+    createdAt: integer('created_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('draw_exclusions_run_participant_unique').on(
+      table.drawRunId,
+      table.participantId,
+    ),
+  ],
+);
+
+export const rerollSessions = sqliteTable(
+  'reroll_sessions',
+  {
+    id: text('id').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    operatorTelegramId: integer('operator_telegram_id').notNull(),
+    placeNumber: integer('place_number').notNull(),
+    state: text('state').notNull(),
+    reason: text('reason'),
+    operationId: text('operation_id').references(() => rerollOperations.id),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (table) => [
+    uniqueIndex('reroll_sessions_operator_active_unique')
+      .on(table.operatorTelegramId)
+      .where(sql`${table.state} in ('awaiting_reason', 'awaiting_confirmation')`),
+  ],
+);
+
+export const drawNotifications = sqliteTable(
+  'draw_notifications',
+  {
+    id: text('id').primaryKey(),
+    giveawayId: text('giveaway_id')
+      .notNull()
+      .references(() => giveaways.id),
+    drawRunId: text('draw_run_id')
+      .notNull()
+      .references(() => drawRuns.id),
+    rerollOperationId: text('reroll_operation_id').references(
+      () => rerollOperations.id,
+    ),
+    recipientTelegramId: integer('recipient_telegram_id').notNull(),
+    kind: text('kind').notNull(),
+    payload: text('payload').notNull(),
+    status: text('status').notNull(),
+    attempts: integer('attempts').notNull().default(0),
+    availableAt: integer('available_at').notNull().default(0),
+    lastErrorKind: text('last_error_kind'),
+    createdAt: integer('created_at').notNull(),
+    updatedAt: integer('updated_at').notNull(),
+  },
+  (table) => [
+    index('draw_notifications_due_index').on(
+      table.status,
+      table.availableAt,
+    ),
   ],
 );

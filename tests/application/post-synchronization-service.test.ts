@@ -121,7 +121,224 @@ async function openSynchronization() {
   };
 }
 
+async function seedCompletedDraw(
+  database: Awaited<ReturnType<typeof openSynchronization>>['database'],
+) {
+  const snapshot = {
+    version: 1,
+    createdAt: NOW,
+    winnerCount: 1,
+    participants: [
+      {
+        participantId: 'participant-1',
+        telegramUserId: 900,
+        username: null,
+        displayName: 'Participant',
+        inviterParticipantId: null,
+        validDirectReferralCount: 0,
+        ticketCount: 1,
+      },
+      {
+        participantId: 'participant-2',
+        telegramUserId: 901,
+        username: 'next_winner',
+        displayName: 'Next Winner',
+        inviterParticipantId: null,
+        validDirectReferralCount: 0,
+        ticketCount: 1,
+      },
+    ],
+    ticketOrder: ['participant-1', 'participant-2'],
+  };
+  await database.execute(
+    "update giveaways set state = 'completed' where id = 'giveaway-1'",
+  );
+  await database.execute(
+    `insert into draw_runs (
+       id, giveaway_id, snapshot_version, snapshot_json, cursor,
+       result_revision, started_at, snapshot_created_at, completed_at, updated_at
+     ) values ('draw-1', 'giveaway-1', 1, ?, 1, 1, ?, ?, ?, ?)`,
+    [JSON.stringify(snapshot), NOW, NOW, NOW, NOW],
+  );
+  await database.execute(
+    `insert into prize_place_versions (
+       id, draw_run_id, place_number, version, state, participant_id,
+       created_at, rejected_at
+     ) values ('place-1', 'draw-1', 1, 1, 'selected', 'participant-1', ?, null)`,
+    [NOW],
+  );
+  await database.execute(
+    `update sync_tasks
+        set task_type = 'result', payload = '{"revision":1}', status = 'pending',
+            available_at = ? where id = 'counter-1'`,
+    [NOW],
+  );
+}
+
 describe('giveaway post synchronization', () => {
+  it('publishes only the current result and removes the participation button', async () => {
+    const { database, gateway, service } = await openSynchronization();
+    await seedCompletedDraw(database);
+
+    expect(await service.synchronizePending()).toBe(1);
+
+    expect(gateway.edits).toEqual([
+      {
+        chatId: -1001,
+        messageId: 42,
+        kind: 'text',
+        text: ['Gift', '', 'Итоги:', '1. Participant'].join('\n'),
+        entities: [
+          {
+            type: 'text_link',
+            offset: 16,
+            length: 11,
+            url: 'tg://user?id=900',
+          },
+        ],
+        removeParticipationButton: true,
+      },
+    ]);
+  });
+
+  it('keeps a result task pending when a newer revision arrives during editing', async () => {
+    const { database, gateway, service } = await openSynchronization();
+    await seedCompletedDraw(database);
+    gateway.beforeEdit = async () => {
+      gateway.beforeEdit = undefined;
+      await database.transaction(async (transaction) => {
+        await transaction.execute(
+          "update prize_place_versions set state = 'rejected', rejected_at = ? where id = 'place-1'",
+          [NOW + 1],
+        );
+        await transaction.execute(
+          `insert into prize_place_versions (
+             id, draw_run_id, place_number, version, state, participant_id,
+             created_at, rejected_at
+           ) values ('place-2', 'draw-1', 1, 2, 'selected', 'participant-2', ?, null)`,
+          [NOW + 1],
+        );
+        await transaction.execute(
+          "update draw_runs set result_revision = 2 where id = 'draw-1'",
+        );
+        await transaction.execute(
+          `update sync_tasks set payload = '{"revision":2}', status = 'pending'
+            where id = 'counter-1'`,
+        );
+      });
+    };
+
+    expect(await service.synchronizePending()).toBe(1);
+    expect(
+      await database.all("select status, payload from sync_tasks where id = 'counter-1'"),
+    ).toEqual([{ status: 'pending', payload: '{"revision":2}' }]);
+    expect(await service.synchronizePending()).toBe(1);
+    expect(gateway.edits[1]?.text).toContain('@next_winner');
+  });
+
+  it('records successful public synchronization in the private reroll audit', async () => {
+    const { database, service } = await openSynchronization();
+    await seedCompletedDraw(database);
+    await database.execute(
+      `insert into reroll_operations (
+         id, draw_run_id, place_number, operator_telegram_id, reason,
+         previous_participant_id, new_participant_id, skipped_candidates,
+         status, cursor_before, cursor_after, result_revision,
+         sync_status, notification_status, started_at, finished_at
+       ) values ('operation-1', 'draw-1', 1, 700, 'manual_review',
+                 'participant-1', 'participant-2', '[]', 'completed',
+                 1, 2, 2, 'pending', 'pending', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `update sync_tasks
+          set payload = '{"revision":2,"rerollOperationId":"operation-1"}'
+        where id = 'counter-1'`,
+    );
+
+    await service.synchronizePending();
+
+    expect(
+      await database.all(
+        "select sync_status from reroll_operations where id = 'operation-1'",
+      ),
+    ).toEqual([{ sync_status: 'delivered' }]);
+  });
+
+  it('keeps reroll audit retrying while any channel result task still has an error', async () => {
+    const { database, gateway, service } = await openSynchronization();
+    await seedCompletedDraw(database);
+    await database.execute(
+      `insert into reroll_operations (
+         id, draw_run_id, place_number, operator_telegram_id, reason,
+         previous_participant_id, new_participant_id, skipped_candidates,
+         status, cursor_before, cursor_after, result_revision,
+         sync_status, notification_status, started_at, finished_at
+       ) values ('operation-1', 'draw-1', 1, 700, 'manual_review',
+                 'participant-1', 'participant-2', '[]', 'completed',
+                 1, 2, 2, 'pending', 'pending', ?, ?)`,
+      [NOW, NOW],
+    );
+    const payload = '{"revision":2,"rerollOperationId":"operation-1"}';
+    await database.execute(
+      'update sync_tasks set payload = ? where id = ?',
+      [payload, 'counter-1'],
+    );
+    await database.execute(
+      `insert into giveaway_channels (
+         id, giveaway_id, telegram_chat_id, username, title,
+         owner_telegram_id, status, created_at, updated_at
+       ) values ('channel-2', 'giveaway-1', -1002, 'channel_two', 'Two',
+                 700, 'confirmed', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into publication_deliveries (
+         id, publication_run_id, giveaway_channel_id, status, message_id,
+         message_kind, created_at, updated_at
+       ) values ('delivery-2', 'run-1', 'channel-2', 'delivered', 43,
+                 'text', ?, ?)`,
+      [NOW, NOW],
+    );
+    await database.execute(
+      `insert into sync_tasks (
+         id, giveaway_id, giveaway_channel_id, task_type, payload, status,
+         attempts, available_at, last_error_kind, created_at, updated_at
+       ) values ('result-2', 'giveaway-1', 'channel-2', 'result', ?,
+                 'pending', 0, ?, null, ?, ?)`,
+      [payload, NOW, NOW, NOW],
+    );
+    gateway.failures.push(
+      new TelegramDeliveryError('cannot edit first channel', 'definite'),
+      null,
+    );
+
+    expect(await service.synchronizePending()).toBe(2);
+    expect(
+      await database.all(
+        "select sync_status from reroll_operations where id = 'operation-1'",
+      ),
+    ).toEqual([{ sync_status: 'retrying' }]);
+  });
+
+  it('returns a result rendering failure to durable retry instead of leaving it processing', async () => {
+    const { database, service } = await openSynchronization();
+    await seedCompletedDraw(database);
+    await database.execute(
+      "update giveaways set title = ? where id = 'giveaway-1'",
+      ['x'.repeat(4_090)],
+    );
+
+    expect(await service.synchronizePending()).toBe(1);
+    expect(
+      await database.all(
+        "select status, attempts, last_error_kind from sync_tasks where id = 'counter-1'",
+      ),
+    ).toEqual([
+      { status: 'pending', attempts: 1, last_error_kind: 'unexpected' },
+    ]);
+  });
+
   it('renders the latest participant count and preserves source entities', async () => {
     const { database, gateway, service } = await openSynchronization();
 

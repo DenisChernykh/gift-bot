@@ -54,6 +54,12 @@ describe('SQLite bootstrap', () => {
           'participants',
           'referral_tokens',
           'channel_health_alerts',
+          'draw_runs',
+          'prize_place_versions',
+          'draw_exclusions',
+          'reroll_operations',
+          'reroll_sessions',
+          'draw_notifications',
         ]),
       );
       expect(
@@ -61,6 +67,13 @@ describe('SQLite bootstrap', () => {
           (column) => column.name,
         ),
       ).toEqual(expect.arrayContaining(['available_at', 'last_error_kind']));
+      expect(
+        (await opened.database.all<{ name: string }>(
+          'PRAGMA table_info(reroll_operations)',
+        )).map((column) => column.name),
+      ).toEqual(
+        expect.arrayContaining(['sync_status', 'notification_status']),
+      );
     } finally {
       await close?.();
       rmSync(directory, { force: true, recursive: true });
@@ -362,7 +375,7 @@ describe('migration command wiring', () => {
     }
   });
 
-  it('upgrades a populated 0005 database to Epic 2, reapplies idempotently, and remains integral', async () => {
+  it('upgrades a populated 0005 database through Epic 3, reapplies idempotently, and remains integral', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'gift-bot-0005-upgrade-'));
     const databasePath = join(directory, 'gift-bot.sqlite');
     const migrationsDirectory = fileURLToPath(
@@ -433,12 +446,16 @@ describe('migration command wiring', () => {
       ).toEqual([{ available_at: 0, last_error_kind: null }]);
       expect(
         await opened.database.all(
-          "select name from sqlite_master where type = 'table' and name in ('participants', 'referral_tokens', 'channel_health_alerts') order by name",
+          "select name from sqlite_master where type = 'table' and name in ('participants', 'referral_tokens', 'channel_health_alerts', 'draw_runs', 'prize_place_versions', 'reroll_operations', 'draw_notifications') order by name",
         ),
       ).toEqual([
         { name: 'channel_health_alerts' },
+        { name: 'draw_notifications' },
+        { name: 'draw_runs' },
         { name: 'participants' },
+        { name: 'prize_place_versions' },
         { name: 'referral_tokens' },
+        { name: 'reroll_operations' },
       ]);
       expect(await opened.database.all('PRAGMA integrity_check')).toEqual([
         { integrity_check: 'ok' },

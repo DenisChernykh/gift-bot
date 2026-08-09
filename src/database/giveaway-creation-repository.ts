@@ -992,10 +992,64 @@ export class SqliteGiveawayCreationRepository
         order by g.id, d.created_at, d.id`,
       [administratorTelegramId],
     );
+    const drawFailures = await this.#database.all<{
+      giveawayId: string;
+      stage: string;
+      errorKind: string;
+    }>(
+      `select g.id as giveawayId, r.failure_stage as stage,
+              r.failure_error_kind as errorKind
+         from giveaways g join draw_runs r on r.giveaway_id = g.id
+        where g.created_by_telegram_id = ? and g.state = 'failed'
+          and r.failure_stage is not null and r.failure_error_kind is not null`,
+      [administratorTelegramId],
+    );
+    const notificationDeliveries = await this.#database.all<{
+      giveawayId: string;
+      pendingCount: number;
+      failedCount: number;
+    }>(
+      `select n.giveaway_id as giveawayId,
+              sum(case when n.status in ('pending', 'processing') then 1 else 0 end)
+                as pendingCount,
+              sum(case when n.status = 'failed' then 1 else 0 end)
+                as failedCount
+         from draw_notifications n
+         join giveaways g on g.id = n.giveaway_id
+        where g.created_by_telegram_id = ?
+          and n.status in ('pending', 'processing', 'failed')
+        group by n.giveaway_id`,
+      [administratorTelegramId],
+    );
     return giveaways.map((giveaway) => {
+      const drawFailure = drawFailures.find(
+        (failure) => failure.giveawayId === giveaway.id,
+      );
+      const notificationDelivery = notificationDeliveries.find(
+        (delivery) => delivery.giveawayId === giveaway.id,
+      );
+      const base = notificationDelivery
+        ? {
+            ...giveaway,
+            notificationDelivery: {
+              pendingCount: notificationDelivery.pendingCount,
+              failedCount: notificationDelivery.failedCount,
+            },
+          }
+        : giveaway;
       const rows = failures.filter((failure) => failure.giveawayId === giveaway.id);
       const first = rows[0];
-      if (!first) return giveaway;
+      if (!first) {
+        return drawFailure
+          ? {
+              ...base,
+              drawFailure: {
+                stage: drawFailure.stage,
+                errorKind: drawFailure.errorKind,
+              },
+            }
+          : base;
+      }
       const affected = rows.filter((row) =>
         first.stage.includes('unknown')
           ? ['sending', 'unknown', 'delivered'].includes(row.deliveryStatus ?? '')
@@ -1004,7 +1058,15 @@ export class SqliteGiveawayCreationRepository
             : true,
       );
       return {
-        ...giveaway,
+        ...base,
+        ...(drawFailure
+          ? {
+              drawFailure: {
+                stage: drawFailure.stage,
+                errorKind: drawFailure.errorKind,
+              },
+            }
+          : {}),
         failure: {
           stage: first.stage,
           errorKind: first.errorKind,
@@ -1349,8 +1411,16 @@ export class SqliteGiveawayCreationRepository
          join giveaways g on g.id = r.giveaway_id
         where g.id = ?
           and ((g.state = 'active' and r.status = 'succeeded')
-            or (g.state = 'failed' and r.status = 'failed'
-              and r.id = g.failure_run_id))
+            or (g.state = 'failed' and (
+              (g.failure_run_id is not null and r.status = 'failed'
+                and r.id = g.failure_run_id)
+              or (g.failure_run_id is null and r.status = 'succeeded'
+                and exists (
+                  select 1 from draw_runs dr
+                   where dr.giveaway_id = g.id
+                     and dr.failure_stage is not null
+                ))
+            )))
           and d.status = 'delivered' and d.message_id is not null`,
       [giveawayId],
     );
@@ -1421,8 +1491,13 @@ export class SqliteGiveawayCreationRepository
       );
       await transaction.execute(
         `update sync_tasks set status = 'superseded', updated_at = ?
-          where giveaway_id = ? and task_type = 'participant_count'
+          where giveaway_id = ? and task_type in ('participant_count', 'result')
             and status in ('pending', 'processing')`,
+        [input.now, input.giveawayId],
+      );
+      await transaction.execute(
+        `update draw_notifications set status = 'superseded', updated_at = ?
+          where giveaway_id = ? and status in ('pending', 'processing')`,
         [input.now, input.giveawayId],
       );
 
@@ -1445,7 +1520,13 @@ export class SqliteGiveawayCreationRepository
           where r.giveaway_id = ?
             and (
               (? = 'active' and r.status = 'succeeded')
-              or (? = 'failed' and r.status = 'failed' and r.id = ?)
+              or (? = 'failed' and (
+                (? is not null and r.status = 'failed' and r.id = ?)
+                or (? is null and r.status = 'succeeded' and exists (
+                  select 1 from draw_runs dr
+                   where dr.giveaway_id = ? and dr.failure_stage is not null
+                ))
+              ))
             )
             and d.status = 'delivered' and d.message_id is not null
           order by d.created_at, d.id`,
@@ -1454,6 +1535,9 @@ export class SqliteGiveawayCreationRepository
           giveaway.state,
           giveaway.state,
           giveaway.failureRunId,
+          giveaway.failureRunId,
+          giveaway.failureRunId,
+          input.giveawayId,
         ],
       );
       if (input.syncTaskIds.length < deliveries.length) {

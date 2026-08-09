@@ -50,6 +50,20 @@
       "when": 1786224560219,
       "tag": "0006_wonderful_talkback",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1786263074050,
+      "tag": "0007_useful_cannonball",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1786264066229,
+      "tag": "0008_natural_mysterio",
+      "breakpoints": true
     }
   ]
 }

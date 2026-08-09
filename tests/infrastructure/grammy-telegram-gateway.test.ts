@@ -22,6 +22,7 @@ describe('classifyTelegramError', () => {
     );
 
     expect(classifyTelegramError(error)).toMatchObject({
+      kind: 'rate_limited',
       outcome: 'definite',
       retryAfterMs: 7000,
     });
@@ -36,6 +37,7 @@ describe('classifyTelegramError', () => {
     );
 
     expect(classifyTelegramError(error)).toMatchObject({
+      kind: 'client',
       outcome: 'definite',
       retryAfterMs: null,
     });
@@ -50,8 +52,14 @@ describe('classifyTelegramError', () => {
     );
     const networkError = new HttpError('network failed', new Error('ECONNRESET'));
 
-    expect(classifyTelegramError(serverError).outcome).toBe('unknown');
-    expect(classifyTelegramError(networkError).outcome).toBe('unknown');
+    expect(classifyTelegramError(serverError)).toMatchObject({
+      kind: 'server',
+      outcome: 'unknown',
+    });
+    expect(classifyTelegramError(networkError)).toMatchObject({
+      kind: 'network',
+      outcome: 'unknown',
+    });
   });
 });
 

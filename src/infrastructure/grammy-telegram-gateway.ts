@@ -17,25 +17,29 @@ export function classifyTelegramError(error: unknown): TelegramDeliveryError {
         error.description,
         'definite',
         retryAfter * 1000,
-        { cause: error },
+        { cause: error, kind: 'rate_limited' },
       );
     }
     if (error.error_code >= 400 && error.error_code < 500) {
       return new TelegramDeliveryError(error.description, 'definite', null, {
         cause: error,
+        kind: 'client',
       });
     }
     return new TelegramDeliveryError(error.description, 'unknown', null, {
       cause: error,
+      kind: 'server',
     });
   }
   if (error instanceof HttpError) {
     return new TelegramDeliveryError(error.message, 'unknown', null, {
       cause: error,
+      kind: 'network',
     });
   }
   return new TelegramDeliveryError('Unexpected Telegram failure', 'unknown', null, {
     cause: error,
+    kind: 'network',
   });
 }
 

@@ -35,6 +35,11 @@ export type TelegramPostEdit = TelegramPostEditBase &
   );
 
 export type TelegramDeliveryOutcome = 'definite' | 'unknown';
+export type TelegramFailureKind =
+  | 'rate_limited'
+  | 'server'
+  | 'network'
+  | 'client';
 
 export type TelegramChannelSnapshot = {
   username: string | null;
@@ -45,17 +50,25 @@ export type TelegramChannelSnapshot = {
 export class TelegramDeliveryError extends Error {
   readonly outcome: TelegramDeliveryOutcome;
   readonly retryAfterMs: number | null;
+  readonly kind: TelegramFailureKind;
 
   constructor(
     message: string,
     outcome: TelegramDeliveryOutcome,
     retryAfterMs: number | null = null,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { kind?: TelegramFailureKind },
   ) {
     super(message, options);
     this.name = 'TelegramDeliveryError';
     this.outcome = outcome;
     this.retryAfterMs = retryAfterMs;
+    this.kind =
+      options?.kind ??
+      (retryAfterMs !== null
+        ? 'rate_limited'
+        : outcome === 'unknown'
+          ? 'network'
+          : 'client');
   }
 }
 

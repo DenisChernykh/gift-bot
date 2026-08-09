@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomInt } from 'node:crypto';
 
 import 'dotenv/config';
 import { Bot, GrammyError, HttpError } from 'grammy';
@@ -8,15 +9,20 @@ import { CallbackActionService } from './application/callback-action-service.js'
 import { ChannelHealthAlertService } from './application/channel-health-alert-service.js';
 import { ChannelAuthorizationService } from './application/channel-authorization-service.js';
 import { DraftWizardService } from './application/draft-wizard-service.js';
+import { DrawNotificationService } from './application/draw-notification-service.js';
+import { GiveawayDrawService } from './application/giveaway-draw-service.js';
 import { GiftBotMaintenanceService } from './application/gift-bot-maintenance-service.js';
 import { GiveawayCancellationService } from './application/giveaway-cancellation-service.js';
 import { GiveawayManagementService } from './application/giveaway-management-service.js';
 import { GiveawayPostSynchronizationService } from './application/giveaway-post-synchronization-service.js';
 import { GiveawayPublicationService } from './application/giveaway-publication-service.js';
 import { GiveawayRecoveryService } from './application/giveaway-recovery-service.js';
+import { GiveawayRerollService } from './application/giveaway-reroll-service.js';
 import { ParticipantRegistrationService } from './application/participant-registration-service.js';
 import { parseTeamTelegramIds } from './config/team-telegram-ids.js';
+import { parseDrawMembershipConcurrency } from './config/draw.js';
 import { openDatabase } from './database/client.js';
+import { SqliteDrawRepository } from './database/draw-repository.js';
 import { SqliteGiveawayCreationRepository } from './database/giveaway-creation-repository.js';
 import { migrateDatabase } from './database/migrate.js';
 import { SqliteParticipantRepository } from './database/participant-repository.js';
@@ -34,6 +40,9 @@ const databasePath = requiredEnvironment('DATABASE_PATH');
 const teamTelegramIds = new Set(
   parseTeamTelegramIds(requiredEnvironment('TEAM_TELEGRAM_IDS')),
 );
+const drawMembershipConcurrency = parseDrawMembershipConcurrency(
+  process.env.DRAW_MEMBERSHIP_CONCURRENCY,
+);
 const logger = createJsonLogger(process.env.LOG_LEVEL ?? 'info');
 
 mkdirSync(dirname(databasePath), { recursive: true });
@@ -46,6 +55,7 @@ const inFlightUpdates = new InFlightUpdateTracker();
 bot.use(inFlightUpdates.middleware());
 const gateway = new GrammyTelegramGateway(bot.api, bot.botInfo.id);
 const participantRepository = new SqliteParticipantRepository(opened.database);
+const drawRepository = new SqliteDrawRepository(opened.database);
 const postSynchronization = new GiveawayPostSynchronizationService(
   new SqlitePostSynchronizationRepository(opened.database, {
     botUsername: bot.botInfo.username,
@@ -53,7 +63,18 @@ const postSynchronization = new GiveawayPostSynchronizationService(
   gateway,
 );
 const alerts = new ChannelHealthAlertService(participantRepository, gateway);
-const maintenance = new GiftBotMaintenanceService(postSynchronization, alerts);
+const draws = new GiveawayDrawService(drawRepository, gateway, {
+  randomInt,
+  membershipConcurrency: drawMembershipConcurrency,
+  teamTelegramIds: [...teamTelegramIds],
+});
+const drawNotifications = new DrawNotificationService(drawRepository, gateway);
+const maintenance = new GiftBotMaintenanceService(
+  postSynchronization,
+  alerts,
+  draws,
+  drawNotifications,
+);
 const wizard = new DraftWizardService(repository);
 const channels = new ChannelAuthorizationService(repository);
 const callbacks = new CallbackActionService(repository);
@@ -72,6 +93,9 @@ const participants = new ParticipantRegistrationService(
   gateway,
   { botUsername: bot.botInfo.username },
 );
+const rerolls = new GiveawayRerollService(drawRepository, gateway, {
+  teamTelegramIds: [...teamTelegramIds],
+});
 
 registerGiftBotHandlers(bot, {
   teamTelegramIds,
@@ -83,6 +107,8 @@ registerGiftBotHandlers(bot, {
   cancellation,
   management,
   participants,
+  draws,
+  rerolls,
 });
 bot.catch((failure) => {
   const error = failure.error;
