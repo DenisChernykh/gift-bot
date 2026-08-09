@@ -36,6 +36,7 @@ function fixture(options: {
   username?: string;
   lintExitCode?: number;
   bootstrapExitCode?: number;
+  printExitCode?: number;
   installed?: boolean;
   loaded?: boolean;
   linkErrorCode?: string;
@@ -127,7 +128,7 @@ function fixture(options: {
       }
       if (command === 'launchctl' && args[0] === 'print') {
         return {
-          exitCode: options.loaded ? 0 : 113,
+          exitCode: options.printExitCode ?? (options.loaded ? 0 : 113),
           stdout: '',
           stderr: '',
         };
@@ -281,6 +282,16 @@ describe('MacosLaunchAgentService install', () => {
     expect(files.has(paths.temporaryPlistPath)).toBe(false);
     expect(events.join('\n')).not.toContain('raw bootstrap detail');
   });
+
+  it('rejects an unexpected launchctl print failure before filesystem mutation', async () => {
+    const { service, events, files } = fixture({ printExitCode: 5 });
+
+    await expect(service.install()).rejects.toThrow('launchctl print failed');
+
+    expect(firstMutation(events)).toBe(-1);
+    expect(files.has(paths.plistPath)).toBe(false);
+    expect(files.has(paths.temporaryPlistPath)).toBe(false);
+  });
 });
 
 function lifecycleFixture(options: {
@@ -288,6 +299,7 @@ function lifecycleFixture(options: {
   loaded?: boolean;
   bootoutCompletion?: Promise<void>;
   bootoutExitCode?: number;
+  printExitCode?: number;
 } = {}) {
   let loaded = options.loaded ?? false;
   const files = new Set<string>();
@@ -312,7 +324,11 @@ function lifecycleFixture(options: {
     run: async (command, args) => {
       events.push(`run:${command}:${args.join(' ')}`);
       if (command === 'launchctl' && args[0] === 'print') {
-        return { exitCode: loaded ? 0 : 113, stdout: '', stderr: '' };
+        return {
+          exitCode: options.printExitCode ?? (loaded ? 0 : 113),
+          stdout: '',
+          stderr: '',
+        };
       }
       if (command === 'launchctl' && args[0] === 'bootstrap') loaded = true;
       if (command === 'launchctl' && args[0] === 'bootout') {
@@ -452,6 +468,37 @@ describe('MacosLaunchAgentService lifecycle', () => {
 
     expect(files.has(paths.plistPath)).toBe(true);
     expect(events.filter((event) => event.startsWith('unlink:'))).toHaveLength(0);
+  });
+
+  it('fails restart closed when launchctl cannot inspect service state', async () => {
+    const { service, events, isLoaded } = lifecycleFixture({
+      loaded: true,
+      printExitCode: 5,
+    });
+
+    await expect(service.restart()).rejects.toThrow('launchctl print failed');
+
+    expect(isLoaded()).toBe(true);
+    expect(events.filter((event) => event.includes(':bootout '))).toHaveLength(0);
+    expect(events.filter((event) => event.includes(':bootstrap '))).toHaveLength(0);
+  });
+
+  it('fails uninstall closed when launchctl cannot inspect service state', async () => {
+    const { service, events, files } = lifecycleFixture({
+      loaded: true,
+      printExitCode: 5,
+    });
+
+    await expect(service.uninstall()).rejects.toThrow('launchctl print failed');
+
+    expect(files.has(paths.plistPath)).toBe(true);
+    expect(events.filter((event) => event.startsWith('unlink:'))).toHaveLength(0);
+  });
+
+  it('does not report status when launchctl cannot inspect service state', async () => {
+    const { service } = lifecycleFixture({ printExitCode: 5 });
+
+    await expect(service.status()).rejects.toThrow('launchctl print failed');
   });
 
   it('returns status, paths and byte-bounded log tails without parsing launchctl output', async () => {

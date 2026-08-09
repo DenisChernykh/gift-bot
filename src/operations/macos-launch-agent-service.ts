@@ -38,6 +38,7 @@ export type LaunchAgentHost = {
 };
 
 export const MAX_LOG_TAIL_BYTES = 64 * 1024;
+const LAUNCHCTL_SERVICE_NOT_FOUND_EXIT_CODE = 113;
 
 export type LaunchAgentOperationState =
   | 'installed'
@@ -142,7 +143,7 @@ export class MacosLaunchAgentService {
     if (username !== PRODUCTION_BOT_USERNAME) {
       throw new Error(`Expected @${PRODUCTION_BOT_USERNAME}`);
     }
-    if ((await host.run('launchctl', ['print', this.serviceTarget])).exitCode === 0) {
+    if (await this.isLoaded()) {
       throw new Error('LaunchAgent is already loaded');
     }
 
@@ -193,9 +194,13 @@ export class MacosLaunchAgentService {
   }
 
   private async isLoaded(): Promise<boolean> {
-    return (
-      await this.input.host.run('launchctl', ['print', this.serviceTarget])
-    ).exitCode === 0;
+    const result = await this.input.host.run('launchctl', [
+      'print',
+      this.serviceTarget,
+    ]);
+    if (result.exitCode === 0) return true;
+    if (result.exitCode === LAUNCHCTL_SERVICE_NOT_FOUND_EXIT_CODE) return false;
+    throw new Error('launchctl print failed');
   }
 
   async start(): Promise<'started' | 'already_loaded'> {
