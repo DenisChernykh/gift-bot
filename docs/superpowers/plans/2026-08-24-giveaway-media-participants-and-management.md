@@ -4,14 +4,14 @@
 
 **Цель:** расширить создание розыгрыша до текста с 0–6 фотографиями (внутренняя модель до 10), дать оператору выбор положения caption, сохранить Telegram custom emoji, добавить приватный постраничный список участников и собрать управление розыгрышем в понятную карточку.
 
-**Архитектурное решение:** контент и медиа хранятся раздельно. Один снимок публикуется текущим одиночным сообщением; 2–6 снимков — Telegram-альбомом. Альбом не принимает `reply_markup`, поэтому его CTA «Участвовать» будет отдельным коротким соседним сообщением; первый элемент альбома остаётся каноническим caption для счётчика, результатов и отмены. Все Telegram message IDs одной доставки хранятся явно, а синхронизация знает, какой из них редактировать или удалить.
+**Архитектурное решение:** контент и медиа хранятся раздельно. Один снимок публикуется текущим одиночным сообщением; 2–6 снимков — Telegram-альбомом. `sendMediaGroup` не принимает `reply_markup` в исходном вызове, но после его успешного ответа бот прикрепляет inline-кнопку к первому сообщению альбома через `editMessageReplyMarkup`. Первый элемент остаётся каноническим caption для счётчика, результатов и отмены. Все Telegram message IDs одной доставки хранятся явно, а recovery завершает безопасную вторую операцию добавления кнопки, если процесс был остановлен между двумя вызовами.
 
 **Стек:** Node 24.18.1, TypeScript ESM, grammY 1.45.x, Drizzle ORM, `node:sqlite`, Vitest 4.
 
 ## Подтверждённые ограничения Telegram
 
 - `show_caption_above_media` поддерживается для photo/video/animation caption и должен быть передан при отправке/редактировании соответствующего сообщения: [Bot API](https://core.telegram.org/bots/api#inputmediaphoto).
-- `sendMediaGroup` отправляет альбом из **2–10** медиафайлов, но среди его параметров нет `reply_markup`: [Bot API](https://core.telegram.org/bots/api#sendmediagroup). Следовательно, один Telegram-альбом с inline-кнопкой «Участвовать» технически недоступен через Bot API.
+- `sendMediaGroup` отправляет альбом из **2–10** медиафайлов, но среди его параметров нет `reply_markup`: [Bot API](https://core.telegram.org/bots/api#sendmediagroup). После ответа можно установить keyboard на конкретное возвращённое сообщение через [`editMessageReplyMarkup`](https://core.telegram.org/bots/api#editmessagereplymarkup); план делает это для первого, канонического элемента альбома. Визуальную поддержку этого сочетания Telegram-клиентами нужно подтвердить real smoke.
 - `MessageEntity` поддерживает `type: custom_emoji` и поле `custom_emoji_id`: [Bot API](https://core.telegram.org/bots/api#messageentity). Это позволяет передавать исходную entity без преобразования в обычный emoji.
 - Видимость custom emoji, отправленных именно ботом в канал, должна быть подтверждена реальным smoke на production identity. Этот план не предполагает покупку Fragment username, смену username или изменение Premium-статуса без отдельного согласования.
 
@@ -24,8 +24,8 @@
    - Для альбома caption находится у первого элемента; значение `show_caption_above_media` передаётся согласованно для всех элементов группы.
 4. Публикация без фото — одно text-сообщение с условиями, счётчиком и кнопкой.
 5. Публикация с одним фото — одно photo-сообщение с caption, счётчиком и кнопкой.
-6. Публикация с 2–6 фото — альбом, где первый элемент содержит канонический caption с условиями и счётчиком, плюс сразу следующее короткое CTA-сообщение с кнопкой «Участвовать». Caption визуально расположен по выбору оператора; CTA существует только из-за ограничения Bot API.
-7. При росте счётчика редактируется канонический text/caption. При итогах или отмене обновляется он же, а CTA альбома удаляется. Медиа не переотправляются и не дублируются.
+6. Публикация с 2–6 фото — альбом, где первый элемент содержит канонический caption с условиями и счётчиком. После успешной отправки группы бот прикрепляет кнопку «Участвовать» к этому первому сообщению отдельным `editMessageReplyMarkup`.
+7. При росте счётчика редактируется канонический text/caption и сохраняется его keyboard. При итогах или отмене обновляется тот же caption и keyboard удаляется. Медиа не переотправляются и не дублируются.
 8. «Участники» доступны только allowlisted-команде и только в карточках, которые уже доступны этому оператору. В выдачу попадают display name, `@username` при наличии и время первой регистрации — без телефонов, raw token, реферальных секретов и внутренних SQLite ID.
 9. Исходный выбор победителя остаётся автоматическим по дедлайну. В карточке не появляется ручная кнопка «Выбрать победителя» для `active`, чтобы не сломать уже утверждённую гарантию неизменяемого snapshot. Для `completed` остаётся перевыбор конкретного занятого места.
 
@@ -78,9 +78,9 @@
 
 - Добавить `giveaway_media` (`id`, `giveaway_id`, `position`, `telegram_file_id`, `created_at`) с unique `(giveaway_id, position)` и constraint позиции 1–10 на прикладном уровне.
 - Добавить к giveaway nullable `media_caption_position` (`above | below`); старые photo получают `below`, соответствующий нынешнему Telegram поведению.
-- Развить single-message `publication_deliveries` в явные delivery parts: `canonical`, `album_media`, `cta`. Для каждого хранить `message_id`, позицию фото, optional `media_group_id`, состояние и порядок.
-- Миграция заполняет `canonical` из уже сохранённого `message_id`. Никакая старая активная публикация не получает новый CTA или новый album part задним числом.
-- `sync_tasks`, cancellation и result sync адресуются к каноническому сообщению; CTA является зависимой частью и при terminal state удаляется с идемпотентной обработкой `message not found`.
+- Развить single-message `publication_deliveries` в явные delivery parts: `canonical` и `album_media`. Для каждого хранить `message_id`, позицию фото, optional `media_group_id`, состояние и порядок; `canonical` также хранит состояние начального attach keyboard.
+- Миграция заполняет `canonical` из уже сохранённого `message_id`. Никакая старая активная публикация не получает новые album parts задним числом.
+- `sync_tasks`, cancellation и result sync адресуются к каноническому сообщению; terminal edit удаляет его inline keyboard. Остальные album parts неизменны.
 
 - [ ] Написать RED миграционные тесты для чистой БД, повторного `db:migrate` и populated fixtures до Epic 3.
 - [ ] Проверить upgrade старого active text, active photo, completed photo и failed publication: schema/foreign-key/integrity проходят, сохранённый message ID остаётся каноническим.
@@ -103,7 +103,7 @@
 2. Шаг `media`: показать кнопки «Без фото» и «Готово». До «Готово» сохранять каждое полученное фото в порядке update; album messages с одним `media_group_id` не переводят wizard после первой фотографии.
 3. После первой фотографии кнопка «Готово» доступна; при шестой UI сообщает о достигнутом лимите. Седьмое фото отклоняется без порчи уже сохранённого черновика.
 4. При одном или более фото показать кнопки «Фото сверху» / «Фото снизу». Затем открыть channels/preview как сейчас.
-5. Предпросмотр должен передавать исходные `entities`/`caption_entities`, чтобы custom emoji выглядели так же, как в канале. Для альбома preview использует реальный album плюс неинтерактивный макет CTA.
+5. Предпросмотр должен передавать исходные `entities`/`caption_entities`, чтобы custom emoji выглядели так же, как в канале. Для альбома preview отправляет album, а затем привязывает preview keyboard к его первому сообщению тем же API-путём, что и production.
 
 - [ ] Написать RED adapter-тесты для text-only, одного фото, media group из 2/6 фото, повторного delivery/update, седьмого фото, `Готово` до фото и отмены черновика посередине загрузки.
 - [ ] Отдельно покрыть caption/custom emoji только у первого сообщения Telegram-альбома и отсутствие потери entities в preview.
@@ -128,17 +128,17 @@
 
 **Gateway contract:**
 
-- `sendGiveawayMessage` становится publication operation, которая возвращает все известные message parts, а не один `messageId`.
+- `sendGiveawayMessage` становится publication operation, которая возвращает все известные message parts, а не один `messageId`; отдельный идемпотентный gateway operation привязывает keyboard к известному canonical message.
 - Для одного фото вызвать `sendPhoto` с `caption`, `caption_entities`, `show_caption_above_media` и inline keyboard.
-- Для 2–10 фото вызвать `sendMediaGroup` с ordered `InputMediaPhoto[]`; caption/entities назначить только первому фото, `show_caption_above_media` передать согласованно. После успешной группы отправить отдельное text CTA с inline keyboard.
-- Для обновления счётчика и результата редактировать caption первого сообщения альбома. Для terminal result/cancel удалять CTA после успешной фиксации состояния; ошибки удаления обрабатывать существующим durable sync механизмом.
+- Для 2–10 фото вызвать `sendMediaGroup` с ordered `InputMediaPhoto[]`; caption/entities назначить только первому фото, `show_caption_above_media` передать согласованно. После успешного и сохранённого ответа вызвать `editMessageReplyMarkup` для первого message ID и прикрепить participation keyboard.
+- Для обновления счётчика и результата редактировать caption первого сообщения альбома. Для terminal result/cancel передавать пустой `reply_markup`; ошибки edit обрабатывать существующим durable sync механизмом.
 - Для одной фотографии сохранить сегодняшнее поведение: один канонический message одновременно содержит caption и кнопку.
 
-- [ ] Написать RED gateway-тесты на exact grammY calls: single photo above/below, два фото, шесть фото, caption/entities только первого media item, CTA только у альбома и отсутствие `reply_markup` в `sendMediaGroup`.
-- [ ] Написать RED publication/recovery-тесты на second-step CTA failure, unknown album send, известный rollback всех album message IDs, restart после сохранения album но до CTA и отсутствие повторной отправки в uncertain состоянии.
-- [ ] Реализовать отправку и persistence всех parts. Розыгрыш становится `active` только когда каждое требуемое сообщение каждой delivery сохранено как delivered.
-- [ ] Написать RED sync/cancellation/result-тесты: count edit сохраняет custom entities, result edit удаляет CTA, cancellation удаляет кнопку/CTA, и один сбой канала не ломает остальные.
-- [ ] Реализовать latest-wins synchronization и idempotent delete для album CTA.
+- [ ] Написать RED gateway-тесты на exact grammY calls: single photo above/below, два фото, шесть фото, caption/entities только первого media item, отсутствие `reply_markup` в `sendMediaGroup` и последующий `editMessageReplyMarkup` первого album message.
+- [ ] Написать RED publication/recovery-тесты на failure/unknown attach keyboard, unknown album send, известный rollback всех album message IDs, restart после сохранения album но до attach keyboard и отсутствие повторной отправки в uncertain состоянии.
+- [ ] Реализовать отправку, persistence всех parts и идемпотентный attach keyboard. Розыгрыш становится `active` только когда каждое требуемое сообщение и keyboard каждой delivery подтверждены или безопасно восстановлены.
+- [ ] Написать RED sync/cancellation/result-тесты: count edit сохраняет custom entities и keyboard, result/cancellation удаляют keyboard, и один сбой канала не ломает остальные.
+- [ ] Реализовать latest-wins synchronization, включая `message is not modified` как успех для повторного attach того же keyboard.
 
 ## Task 5: Проверенный custom emoji support и production-capability spike
 
@@ -208,7 +208,7 @@
 
 1. Tasks 1–2: domain/storage/migration. **Gate:** old database reopens cleanly; существующие active/completed публикации не меняют Telegram message IDs.
 2. Task 3: wizard/preview. **Gate:** перезапуск в середине альбома не теряет медиа, 7-е фото не меняет draft.
-3. Task 4: publication/sync/recovery. **Gate:** rollback/recovery охватывает album и CTA; ни одна ошибка не создаёт дубль в канале.
+3. Task 4: publication/sync/recovery. **Gate:** rollback/recovery охватывает album и attach keyboard; ни одна ошибка не создаёт дубль в канале.
 4. Task 5: custom emoji spike. **Gate:** реальное визуальное подтверждение в канале либо честно зафиксированный внешний blocker.
 5. Task 6: participants/card. **Gate:** pagination private, stable and actor-bound; automatic draw semantics unchanged.
 6. Task 7: full verification, docs, review.
